@@ -1,0 +1,5 @@
+config TMEM
+tristate "Tmem backend"
+default y
+help
+    Simple memory pool that services tmem calls
