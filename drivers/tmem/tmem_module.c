@@ -1,11 +1,11 @@
 #include <linux/module.h>
+#include <linux/init.h>
 #include <linux/printk.h>
-
 #include "tmem_chrdev.h"
 
 static int __init tmem_init(void)
 {
-	if (tmem_chrdev_init() {
+	if (tmem_chrdev_init()) {
 		pr_info("tmem: device creation failed");
 		return -1;
 	}
