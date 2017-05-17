@@ -1,0 +1,6 @@
+config TMEM_USER
+tristate "Tmem character device (NOT IMPLEMENTED)"
+depends on TMEM_PAGELIST
+default n
+help
+    Character device to be used by userspace when the latter wants to use transactional memory

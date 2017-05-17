@@ -6,18 +6,21 @@
 static int __init tmem_init(void)
 {
 	if (tmem_chrdev_init()) {
-		pr_info("tmem: device creation failed");
-		return -1;
+		goto init_out;
 	}
 
-	pr_info("tmem: character device created");
+	pr_info("character device created\n");
 	return 0;
+
+init_out:
+	pr_debug("device creation failed\n");
+	return -1;
 }
 
 
 static void __exit tmem_exit(void)
 {
-	pr_info("tmem: character device destroyed");
+	pr_info("character device destroyed\n");
 	tmem_chrdev_destroy();
 }
 

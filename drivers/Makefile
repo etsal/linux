@@ -181,4 +181,5 @@ obj-$(CONFIG_NVMEM)		+= nvmem/
 obj-$(CONFIG_FPGA)		+= fpga/
 obj-$(CONFIG_FSI)		+= fsi/
 obj-$(CONFIG_TEE)		+= tee/
-obj-$(CONFIG_TMEM)      += tmem/
+obj-$(CONFIG_TMEM_PAGELIST)	+= tmem/tmem_pagelist/
+obj-$(CONFIG_TMEM_USER)		+= tmem/tmem_user/

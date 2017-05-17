@@ -25,12 +25,23 @@ long tmem_chrdev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 
 int tmem_chrdev_init(void)
 {
+	dev_t dev_no;
+
+	if (alloc_chrdev_region(&dev_no, 0, 0, "tmem_backend"))
+		goto out_init_alloc;
+
 	return 0;
+
+out_init_alloc:
+	pr_debug("major number allocation failed\n");
+	return -1;
 }
 
 
 void tmem_chrdev_destroy(void)
 {
+	dev_t dev_no;
+
 }
 
 

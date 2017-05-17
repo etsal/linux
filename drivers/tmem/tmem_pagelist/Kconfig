@@ -1,0 +1,5 @@
+config TMEM_PAGELIST
+tristate "Tmem naive backend"
+default m
+help
+    Simple memory pool used to emulate tmem using a page list.
