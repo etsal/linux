@@ -1,4 +1,32 @@
-menu "TMEM capabilities"
+config TMEM
+	bool "Transcendent Memory"
+	default y
+	help
+	  Transcendent Memory capabilities. With this option, it is possible to
+	  plug in a simple Transcendent Memory backend (TMEM_PAGELIST), as well
+	  as a device that exposes Transcendent Memory functionality to userspace (TMEM_DEV).
 
-endmenu
+if TMEM
 
+	menu "TMEM capabilities"
+
+	config TMEM_PAGELIST
+	        tristate "Transcendent Memory pagelist backend"
+		default m
+		help
+		  Simple memory pool used to service Transcendent Memory requests.
+		  This dummy backend can be used instead of zswap or Xen for activating
+		  Transcendent Memory capabilities.
+
+	config TMEM_DEV
+		tristate "Transcendent memory character device"
+		default m
+		depends on TMEM_PAGELIST != n
+		help
+		  Character device to be used by userspace when the latter wants to use
+		  transactional memory. Using ioctl() calls, the userspace application can
+		  take advantage of the put/get semantics that Transcendent Memory provides.
+
+	endmenu
+
+endif
