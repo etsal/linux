@@ -2767,8 +2767,7 @@ out:
 		     reg->u32_min_value, reg->u32_max_value,
 		     reg->s32_min_value, reg->s32_max_value,
 		     reg->var_off.value, reg->var_off.mask);
-	if (env->test_reg_invariants)
-		return -EFAULT;
+	return -EFAULT;
 	__mark_reg_unbounded(reg);
 	return 0;
 }
