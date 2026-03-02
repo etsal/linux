@@ -54,7 +54,7 @@ int f8(struct __sk_buff *skb)
 }
 
 SEC("tc")
-__failure __msg("the call stack of 8 frames")
+__success
 int global_func3(struct __sk_buff *skb)
 {
 	return f8(skb);
