@@ -67,10 +67,42 @@ out:
 }
 
 
+static void test_libarena_rbtree(void)
+{
+	struct libarena *skel;
+	int ret;
+
+	skel = libarena__open_and_load();
+	if (!ASSERT_OK_PTR(skel, "open_and_load"))
+		return;
+
+	ret = libarena__attach(skel);
+	if (!ASSERT_OK(ret, "attach"))
+		goto out;
+
+	ret = libarena_run_prog(bpf_program__fd(skel->progs.arena_alloc_reserve));
+	if (!ASSERT_OK(ret, "arena_alloc_reserve"))
+		goto out;
+
+	ret = libarena_run_prog(bpf_program__fd(skel->progs.arena_alloc_init));
+	if (!ASSERT_OK(ret, "arena_alloc_init"))
+		goto out;
+
+	ret = libarena_run_prog(bpf_program__fd(skel->progs.test_rbtree));
+	ASSERT_OK(ret, "test_rbtree");
+
+	libarena_run_prog(bpf_program__fd(skel->progs.arena_alloc_fini));
+out:
+	libarena__destroy(skel);
+}
+
+
 void test_libarena(void)
 {
 	if (test__start_subtest("buddy"))
 		test_libarena_buddy();
 	if (test__start_subtest("minheap"))
 		test_libarena_minheap();
+	if (test__start_subtest("rbtree"))
+		test_libarena_rbtree();
 }

@@ -139,6 +139,7 @@ error_no_destroy:					\
 
 TEST(test_buddy);
 TEST(test_minheap);
+TEST(test_rbtree);
 
 #ifdef BPF_ARENA_ASAN
 TEST(asan_test_buddy);
