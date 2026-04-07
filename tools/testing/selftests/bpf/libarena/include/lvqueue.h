@@ -21,6 +21,8 @@ struct lv_queue {
 
 typedef struct lv_queue __arena lv_queue_t;
 
+#ifdef __BPF__
+
 int lvq_push(lv_queue_t *lvq, u64 val);
 int lvq_pop(lv_queue_t *lvq, u64 *val);
 int lvq_steal(lv_queue_t *lvq, u64 *val);
@@ -29,3 +31,5 @@ u64 lvq_create_internal(void);
 #define lvq_create() ((lv_queue_t *)lvq_create_internal())
 
 int lvq_destroy(lv_queue_t *lvq);
+
+#endif /* __BPF__ */

@@ -1,13 +1,13 @@
 /*
  * SPDX-License-Identifier: GPL-2.0
- * Copyright (c) 2025 Meta Platforms, Inc. and affiliates.
- * Copyright (c) 2025 Emil Tsalapatis <etsal@meta.com>
+ * Copyright (c) 2025-2026 Meta Platforms, Inc. and affiliates.
  */
 
-#include <scx/common.bpf.h>
+#include <common.h>
 
-#include <lib/sdt_task.h>
-#include <lib/lvqueue.h>
+#include <asan.h>
+#include <buddy.h>
+#include <lvqueue.h>
 
 static inline
 u64 lv_arr_size(lv_arr_t *lv_arr)
@@ -51,7 +51,7 @@ int lvq_order_init(lv_queue_t __arg_arena *lvq, int order)
 	if (arr->data)
 		return 0;
 
-	arr->data = (u64 __arena *)scx_static_alloc((LV_ARR_BASESZ << order) * sizeof(*arr->data), 1);
+	arr->data = (u64 __arena *)malloc((LV_ARR_BASESZ << order) * sizeof(*arr->data));
 	if (!arr->data)
 		return -ENOMEM;
 
@@ -174,7 +174,7 @@ u64 lvq_create_internal(void)
 	volatile lv_queue_t *lvq;
 	int ret, i;
 
-	lvq = scx_static_alloc(sizeof(*lvq), 1);
+	lvq = malloc(sizeof(*lvq));
 	if (!lvq)
 		return (u64)NULL;
 
@@ -187,7 +187,7 @@ u64 lvq_create_internal(void)
 
 	ret = lvq_order_init((lv_queue_t *)lvq, 0);
 	if (ret) {
-		/* XXX Free when migrating from the static allocator. */
+		free(lvq);
 		return (u64)NULL;
 	}
 
