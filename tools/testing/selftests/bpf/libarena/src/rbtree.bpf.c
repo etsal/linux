@@ -22,17 +22,21 @@ static int rbnode_replace(rbtree_t *rbtree, rbnode_t *existing, rbnode_t *replac
 	}									\
 } while (0)
 
+__weak
 u64 rb_create_internal(enum rbtree_alloc alloc, enum rbtree_insert_mode insert)
 {
 	rbtree_t *rbtree;
+	volatile rbtree_t *tree;
 
-	/* malloc() returns zero-initialized memory. */
 	rbtree = malloc(sizeof(*rbtree));
 	if (unlikely(!rbtree))
 		return (u64)(NULL);
 
-	rbtree->alloc = alloc;
-	rbtree->insert = insert;
+	tree = rbtree;
+	tree->freelist = 0;
+	tree->root = NULL;
+	tree->alloc = alloc;
+	tree->insert = insert;
 
 	return (u64)rbtree;
 }
@@ -197,7 +201,7 @@ static inline rbnode_t *rb_node_alloc_common(rbtree_t __arg_arena *rbtree, u64 k
 		return NULL;
 
 	/*
-	 * XXXETSAL:  Use a second volatile variable because the verifier demotes
+	 * Use a second volatile variable because the verifier demotes
 	 * the rbnode variable to a scalar during cmpxchg.
 	 */
 
