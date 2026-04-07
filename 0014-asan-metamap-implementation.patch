@@ -1,0 +1,368 @@
+From 3bb5d4bd22c32128438a870481eea20ebc59595f Mon Sep 17 00:00:00 2001
+From: Emil Tsalapatis <etsal@meta.com>
+Date: Wed, 21 Jan 2026 17:17:03 -0800
+Subject: [PATCH 14/14] asan metamap implementation
+
+---
+ .../selftests/bpf/libarena/include/common.h   | 133 +++++++++++++++-
+ .../selftests/bpf/libarena/src/asan.bpf.c     | 143 +++++++++++++++---
+ 2 files changed, 252 insertions(+), 24 deletions(-)
+
+diff --git a/tools/testing/selftests/bpf/libarena/include/common.h b/tools/testing/selftests/bpf/libarena/include/common.h
+index 12fab01d60f9..0a6ddbc8795a 100644
+--- a/tools/testing/selftests/bpf/libarena/include/common.h
++++ b/tools/testing/selftests/bpf/libarena/include/common.h
+@@ -96,8 +96,139 @@ int arena_fls(__u64 word)
+ 	return num;
+ }
+ 
++static inline
++int arena_ffs(__u64 word)
++{
++	unsigned int num = 0;
++
++	if ((word & 0xffffffff) == 0) {
++		num += 32;
++		word >>= 32;
++	}
++
++	if ((word & 0xffff) == 0) {
++		num += 16;
++		word >>= 16;
++	}
++
++	if ((word & 0xff) == 0) {
++		num += 8;
++		word >>= 8;
++	}
++
++	if ((word & 0xf) == 0) {
++		num += 4;
++		word >>= 4;
++	}
++
++	if ((word & 0x3) == 0) {
++		num += 2;
++		word >>= 2;
++	}
++
++	if ((word & 0x1) == 0) {
++		num += 1;
++		word >>= 1;
++	}
++
++	return num;
++}
++
++__weak
++u64 arena_find_word(u64 __arena __arg_arena *bitmap, u64 start, u64 count, bool find_set)
++{
++	u64 word, bit, pos;
++	u64 val;
++	u64 skip_val = find_set ? 0 : (u64)(-1);
++
++	if (!count)
++		return start;
++
++	word = start / 64;
++	bit = start % 64;
++	pos = start;
++
++	/* Check first partial word if not word-aligned. */
++	if (bit) {
++		val = find_set ? bitmap[word] : ~bitmap[word];
++		/* Mask off bits before our starting position. */
++		val &= ~((1ULL << bit) - 1);
++
++		if (val) {
++			u64 found = word * 64 + arena_ffs(val);
++			if (found < start + count)
++				return found;
++			return start + count;
++		}
++
++		word++;
++		pos = word * 64;
++		if (pos >= start + count)
++			return start + count;
++	}
++
++	/* Skip full words that don't contain the bit we're looking for. */
++	for (; pos + 64 <= start + count && can_loop; word++, pos += 64) {
++		if (bitmap[word] != skip_val)
++			break;
++	}
++
++	if (pos >= start + count)
++		return start + count;
++
++	/* Check the word we stopped at. */
++	val = find_set ? bitmap[word] : ~bitmap[word];
++	if (val) {
++		u64 found = word * 64 + arena_ffs(val);
++		if (found < start + count)
++			return found;
++	}
++
++	return start + count;
++}
++
++/*
++ * Set a range of bits in a bitmap.
++ *
++ * @bitmap: pointer to the u64 array
++ * @start: starting bit position
++ * @count: number of bits to set
++ */
++static inline
++void bitmap_set_range(u64 __arena *bitmap, u64 start, u64 count)
++{
++	u64 word, bit, bits_in_word;
++
++	if (!count)
++		return;
++
++	word = start / 64;
++	bit = start % 64;
++
++	/* Handle partial first word. */
++	if (bit) {
++		bits_in_word = 64 - bit;
++		if (count < bits_in_word)
++			bits_in_word = count;
++
++		/* Set bits from 'bit' for 'bits_in_word' bits. */
++		bitmap[word] |= (((1ULL << bits_in_word) - 1) << bit);
++
++		word++;
++		count -= bits_in_word;
++	}
++
++	/* Handle full words. */
++	for (; count >= 64 && can_loop; word++, count -= 64)
++		bitmap[word] = (u64)(-1);
++
++	/* Handle partial last word. */
++	if (count)
++		bitmap[word] |= ((1ULL << count) - 1);
++}
++
+ /*
+- * Userspace API, required for setting up the arena 
++ * Userspace API, required for setting up the arena
+  * address space before starting the allocator.
+  */
+ 
+diff --git a/tools/testing/selftests/bpf/libarena/src/asan.bpf.c b/tools/testing/selftests/bpf/libarena/src/asan.bpf.c
+index 7d39ee7b68bd..5f921f369e33 100644
+--- a/tools/testing/selftests/bpf/libarena/src/asan.bpf.c
++++ b/tools/testing/selftests/bpf/libarena/src/asan.bpf.c
+@@ -11,6 +11,27 @@
+ #pragma clang attribute push(__attribute__((no_sanitize("address"))), \
+ 			     apply_to = function)
+ 
++/*
++ * Shadow meta map. We do not want to naively allocate the maximum map
++ * size (4GiB) at map startup. We instead want to allocate new shadow
++ * map pages on demand. 
++ *
++ * We use a bitmap to track which pages in the shadow map have been allocated.
++ * Each bit corresponds to a >= 4KiB shadow page, and so to a >= 32KiB allocated
++ * region. That means to track the shadow map of a 4GiB region we need
++ *
++ * (4GiB / (32KiB / bit))
++ * = (4GiB) / (256KiB / byte))
++ * = (4096 MiB) / (256KiB / byte)) 
++ * = 16KiB = 256 64-bit words. 
++ *
++ * We allocate this statically.
++ */
++
++#define asan_meta_LEN (256)
++
++u64 __arena asan_meta[asan_meta_LEN];
++
+ #define SHADOW_ALL_ZEROES ((u64)-1)
+ 
+ /*
+@@ -18,6 +39,7 @@
+  */
+ volatile u64 asan_violated = 0;
+ 
++
+ /*
+  * Shadow map occupancy map.
+  */
+@@ -32,6 +54,88 @@ volatile bool asan_inited = false;
+ volatile bool asan_report_once = false;
+ volatile bool asan_emit_stack = false;
+ 
++/*
++ * Metamap access routines.
++ */
++
++static inline
++u64 asan_meta_first_unalloc(u64 pgoff, size_t nr_pages)
++{
++	return arena_find_word(asan_meta, pgoff, nr_pages, false);
++}
++
++static inline
++u64 asan_meta_first_alloc(u64 pgoff, size_t nr_pages)
++{
++	return arena_find_word(asan_meta, pgoff, nr_pages, true);
++}
++
++/*
++ * Allocate any missing shadow map pages for a range
++ * of nr_pages arena pages, starting from pgoff.
++ */
++__weak
++int asan_populate_shadowmap_pages(u64 pgoff, size_t pgleft)
++{
++	u64 pgfirst;
++	void __arena *mem;
++	u64 nr_pages;
++	u64 target;
++
++	while (pgleft && can_loop) {
++
++		/* Find the first unallocated pages within the range. */
++		pgfirst = asan_meta_first_unalloc(pgoff, pgleft);
++		pgleft -= (pgfirst - pgoff);
++		if (!pgleft)
++			return 0;
++
++		/* 
++		 * Find how big the range of unallocated
++		 * pages we can allocate at once.
++		 */
++		nr_pages = asan_meta_first_alloc(pgfirst, pgleft) - pgfirst;
++		pgleft -= nr_pages;
++
++		/* Find the offset */
++		target = __asan_shadow_memory_dynamic_address + (pgfirst * __PAGE_SIZE);
++
++		/* 
++		 * The allocated map pages are zeroed out, meaning all memory is marked as valid
++		 * even if it's not allocated already. This is expected: Since the actual memory
++		 * pages are not allocated, accesses to it will trigger page faults and will be
++		 * reported through BPF streams. Any pages allocated through bpf_arena_alloc_pages
++		 * should be poisoned by the allocator right after the call succeeds.
++		 */
++		mem = bpf_arena_alloc_pages(&arena, (void __arena *)target, nr_pages, NUMA_NO_NODE, 0);
++		if (mem)
++			return -ENOMEM;
++
++		/* Mark the allocated pages in the metamap. */
++		bitmap_set_range(asan_meta, pgfirst, nr_pages);
++
++		pgoff = pgfirst + nr_pages;
++	}
++
++	return 0;
++}
++
++static __always_inline
++int asan_populate_shadowmap(u64 addr, size_t size)
++{
++	u64 pgfirst, pglast;
++	u64 lastaddr;
++
++	/* Get the arena pages to be touched during poisoning. */ 
++
++	pgfirst = addr / __PAGE_SIZE;
++	lastaddr = addr + size - 1;
++	pglast = (lastaddr + __PAGE_SIZE - 1) / __PAGE_SIZE;
++
++	return asan_populate_shadowmap_pages(pgfirst, pglast - pgfirst + 1);
++}
++
++
+ /*
+  * BPF does not currently support the memset/memcpy/memcmp intrinsics.
+  */
+@@ -39,10 +143,6 @@ __always_inline int asan_memset(s8a __arg_arena *dst, s8 val, size_t size)
+ {
+ 	int i;
+ 
+-	/*
+-	 * Switching this to a may_goto confuses the verifier and
+-	 * prevents verification on bpf-next as of late December 2025.
+-	 */
+ 	bpf_for(i, 0, size) {
+ 		dst[i] = val;
+ 	}
+@@ -186,6 +286,15 @@ static __always_inline bool check_region_inline(void *ptr, size_t size,
+ 		return is_valid;
+ 	}
+ 
++	/*
++	 * NOTE: We do not actually check the ASAN meta map here to ensure
++	 * the shadow map page is actually allocated. We do this to avoid
++	 * an extra branch. If the shadow map is unallocated we will trigger
++	 * a page fault, which still gives us the same information as ASAN.
++	 * Since we are touching an unallocated page, the ASAN check itself
++	 * will succeed.
++	 */
++
+ 	switch (size) {
+ 	case 1:
+ 		is_poisoned = memory_is_poisoned_1(addr);
+@@ -298,6 +407,7 @@ __hidden __noasan int asan_poison(void __arena *addr, s8 val, size_t size)
+ {
+ 	s8a *shadow;
+ 	size_t len;
++	int ret;
+ 
+ 	/*
+ 	 * Poisoning from a non-granule address makes no sense: We can only allocate
+@@ -331,6 +441,11 @@ __hidden __noasan int asan_poison(void __arena *addr, s8 val, size_t size)
+ 	if (unlikely(size & ASAN_GRANULE_MASK))
+ 		return -EINVAL;
+ 
++	/* Populate any missing pages in the arena metamap. */
++	ret = asan_populate_shadowmap((u64)addr, size);
++	if (unlikely(ret))
++		return ret;
++
+ 	shadow = mem_to_shadow(addr);
+ 	len = size >> ASAN_SHADOW_SHIFT;
+ 
+@@ -398,7 +513,7 @@ __hidden __noasan int asan_init(struct asan_init_args *args)
+ {
+ 	u64 globals_pages = args->arena_globals_pages;
+ 	u64 all_pages = args->arena_all_pages;
+-	u64 shadowmap, shadow_pgoff;
++	u64 shadow_pgoff;
+ 	u64 shadow_pages;
+ 
+ 	if (asan_inited)
+@@ -433,24 +548,6 @@ __hidden __noasan int asan_init(struct asan_init_args *args)
+ 	shadow_pgoff = all_pages - shadow_pages - globals_pages;
+ 	__asan_shadow_memory_dynamic_address = shadow_pgoff * __PAGE_SIZE;
+ 
+-	/* 
+-	 * Allocate the last (1/ASAN_GRANULE_SIZE)th of an arena's pages for the map
+-	 * We find the offset and size from the arena map.
+-	 *
+-	 * The allocated map pages are zeroed out, meaning all memory is marked as valid
+-	 * even if it's not allocated already. This is expected: Since the actual memory
+-	 * pages are not allocated, accesses to it will trigger page faults and will be
+-	 * reported through BPF streams. Any pages allocated through bpf_arena_alloc_pages
+-	 * should be poisoned by the allocator right after the call succeeds.
+-	 */
+-	shadowmap = (u64)bpf_arena_alloc_pages(
+-		&arena, (void __arena *)__asan_shadow_memory_dynamic_address,
+-		shadow_pages, NUMA_NO_NODE, 0);
+-	if (!shadowmap) {
+-		arena_stderr("Could not allocate shadow map\n");
+-		return -ENOMEM;
+-	}
+-
+ 	asan_inited = true;
+ 
+ 	return 0;
+-- 
+2.47.3
+
