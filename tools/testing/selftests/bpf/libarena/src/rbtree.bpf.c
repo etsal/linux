@@ -1,16 +1,13 @@
 /*
  * SPDX-License-Identifier: GPL-2.0
- * Copyright (c) 2025 Meta Platforms, Inc. and affiliates.
- * Copyright (c) 2025 Emil Tsalapatis <etsal@meta.com>
+ * Copyright (c) 2025-2026 Meta Platforms, Inc. and affiliates.
  */
 
-#include <scx/common.bpf.h>
+#include <common.h>
 
-#include <lib/sdt_task.h>
-#include <lib/rbtree.h>
-
-static struct scx_allocator scx_rbtree_allocator;
-static struct scx_allocator scx_rbnode_allocator;
+#include <asan.h>
+#include <buddy.h>
+#include <rbtree.h>
 
 int rb_integrity_check(rbtree_t __arg_arena *rbtree);
 void rbnode_print(size_t depth, rbnode_t *rbn);
@@ -19,38 +16,20 @@ static int rbnode_replace(rbtree_t *rbtree, rbnode_t *existing, rbnode_t *replac
 #define INTEGRITY_CHECK(rbtree) do {						\
 	int ret = rb_integrity_check(rbtree);					\
 	if (ret) {								\
-		bpf_printk("%s:%d integrity failure", __func__, __LINE__);	\
+		arena_stdout("%s:%d integrity failure", __func__, __LINE__);	\
 		rb_print(rbtree);						\
 		return -EINVAL;							\
 	}									\
 } while (0)
 
-__weak
-int scx_rb_init(void)
-{
-	int ret;
-
-	/* Initialize slab allocators for rbtree_t and rbnode_t. */
-	ret = scx_alloc_init(&scx_rbtree_allocator, sizeof(rbtree_t));
-	if (ret)
-		return ret;
-
-	/* Note that there is no destructor for the slab allocator. */
-	return scx_alloc_init(&scx_rbnode_allocator, sizeof(rbnode_t));
-}
-
 u64 rb_create_internal(enum rbtree_alloc alloc, enum rbtree_insert_mode insert)
 {
-	struct sdt_data __arena *data;
 	rbtree_t *rbtree;
 
-	/* Note that scx_alloc() returns a zero-initialized memory. */
-	data = scx_alloc(&scx_rbtree_allocator);
-	if (unlikely(!data))
+	/* malloc() returns zero-initialized memory. */
+	rbtree = malloc(sizeof(*rbtree));
+	if (unlikely(!rbtree))
 		return (u64)(NULL);
-
-	rbtree = (rbtree_t *)data->payload;
-	rbtree->tid = data->tid;
 
 	rbtree->alloc = alloc;
 	rbtree->insert = insert;
@@ -64,8 +43,6 @@ int rb_destroy(rbtree_t __arg_arena *rbtree)
 	rbnode_t *node, *next;
 	int ret;
 
-	scx_arena_subprog_init();
-
 	while (rbtree->root && can_loop) {
 		ret = rb_remove(rbtree, rbtree->root->key);
 		if (ret)
@@ -75,11 +52,11 @@ int rb_destroy(rbtree_t __arg_arena *rbtree)
 	node = rbtree->freelist;
 	while (node && can_loop) {
 		next = node->parent;
-		scx_alloc_free_idx(&scx_rbnode_allocator, node->tid.idx);
+		free(node);
 		node = next;
 	}
 
-	scx_alloc_free_idx(&scx_rbtree_allocator, rbtree->tid.idx);
+	free(rbtree);
 	return 0;
 }
 
@@ -198,7 +175,6 @@ int rb_find(rbtree_t __arg_arena *rbtree, u64 key, u64 *value)
 
 static inline rbnode_t *rb_node_alloc_common(rbtree_t __arg_arena *rbtree, u64 key, u64 value)
 {
-	struct sdt_data __arena *data;
 	rbnode_t *rbnode;
 	volatile rbnode_t *node;
 
@@ -212,14 +188,11 @@ static inline rbnode_t *rb_node_alloc_common(rbtree_t __arg_arena *rbtree, u64 k
 	} while (cmpxchg(&rbtree->freelist, rbnode, rbnode->parent) != rbnode && can_loop);
 
 	if (!rbnode) {
-		data = scx_alloc(&scx_rbnode_allocator);
-		if (unlikely(!data))
+		rbnode = malloc(sizeof(*rbnode));
+		if (unlikely(!rbnode))
 			return NULL;
-
-		rbnode = (rbnode_t *)data->payload;
-		rbnode->tid = data->tid;
 	}
-	
+
 	if (!rbnode)
 		return NULL;
 
@@ -367,8 +340,8 @@ int rb_insert_node(rbtree_t __arg_arena *rbtree, rbnode_t __arg_arena *node)
 		return -EINVAL;
 
 	node->is_red = true;
-	/* XXXETSAL: Variable i is not used. It is only there to 
-	 * prevent the compiler from causing verification failures 
+	/* XXXETSAL: Variable i is not used. It is only there to
+	 * prevent the compiler from causing verification failures
 	 * in its attempt to optimize the series of assignments
 	 * to the rbnode_t * into a single operation.
 	 */
@@ -538,13 +511,13 @@ static inline int rbnode_remove_node_single_child(rbtree_t *rbtree, rbnode_t *no
 	int dir;
 
 	if (unlikely(node->is_red)) {
-		bpf_printk("Node unexpectedly red");
+		arena_stdout("Node unexpectedly red");
 		return -EINVAL;
 	}
 
 	child = node->left ? node->left : node->right;
 	if (unlikely(!child->is_red)) {
-		bpf_printk("Only child is black");
+		arena_stdout("Only child is black");
 		return -EINVAL;
 	}
 
@@ -634,7 +607,7 @@ int rb_node_remove(rbtree_t __arg_arena *rbtree, rbnode_t __arg_arena *node, boo
 
 	sibling = parent->child[1 - dir];
 	if (unlikely(!sibling)) {
-		bpf_printk("rbtree: removed black node has no sibling");
+		arena_stdout("rbtree: removed black node has no sibling");
 		return -EINVAL;
 	}
 
@@ -661,7 +634,7 @@ int rb_node_remove(rbtree_t __arg_arena *rbtree, rbnode_t __arg_arena *node, boo
 		 */
 		sibling = parent->child[1 - dir];
 		if (unlikely(!sibling)) {
-			bpf_printk("rbtree: removed black node has no sibling");
+			arena_stdout("rbtree: removed black node has no sibling");
 			return -EINVAL;
 		}
 
@@ -817,8 +790,8 @@ int rb_pop(rbtree_t __arg_arena *rbtree, u64 *key, u64 *value)
 
 inline void rbnode_print(size_t depth, rbnode_t *rbn)
 {
-	bpf_printk("[DEPTH %d] %p (%s) PARENT %p", depth, rbn, rbn->is_red ? "red" : "black", rbn->parent);
-	bpf_printk("\tKV (%ld, %ld) LEFT %p RIGHT %p]\n", rbn->key, rbn->value, rbn->left, rbn->right);
+	arena_stdout("[DEPTH %d] %p (%s) PARENT %p", depth, rbn, rbn->is_red ? "red" : "black", rbn->parent);
+	arena_stdout("\tKV (%ld, %ld) LEFT %p RIGHT %p]\n", rbn->key, rbn->value, rbn->left, rbn->right);
 }
 
 enum rb_print_state {
@@ -914,7 +887,7 @@ int rb_print(rbtree_t __arg_arena *rbtree)
 	depth = 0;
 	state = RB_NONE_VISITED;
 
-	bpf_printk("=== BPF PRINTK START ===");
+	arena_stdout("=== BPF PRINTK START ===");
 
 	/* Even with can_loop, the verifier doesn't like infinite loops. */
 	while (can_loop) {
@@ -943,13 +916,13 @@ int rb_print(rbtree_t __arg_arena *rbtree)
 			return -EINVAL;
 
 		if (depth < 0 || depth >= RB_MAXLVL_PRINT) {
-			bpf_printk("=== BPF PRINTK END (depth %d)===", depth);
+			arena_stdout("=== BPF PRINTK END (depth %d)===", depth);
 			return 0;
 		}
 
 	}
 
-	bpf_printk("=== BPF PRINTK END ===");
+	arena_stdout("=== BPF PRINTK END ===");
 
 	return 0;
 }
@@ -977,36 +950,36 @@ int rb_integrity_check(rbtree_t __arg_arena *rbtree)
 	while (can_loop) {
 		if (rbnode->parent && rbnode->parent->left != rbnode
 			&& rbnode->parent->right != rbnode) {
-			bpf_printk("WARNING: Inconsistent tree. Parent %p has no child %p", rbnode->parent, rbnode);
+			arena_stdout("WARNING: Inconsistent tree. Parent %p has no child %p", rbnode->parent, rbnode);
 			return -EINVAL;
 		}
 
 		if (rbnode->parent == rbnode) {
-			bpf_printk("WARNING: Inconsistent tree, node %p is its own parent", rbnode);
+			arena_stdout("WARNING: Inconsistent tree, node %p is its own parent", rbnode);
 			return -EINVAL;
 		}
 
 		if (rbnode->left == rbnode) {
-			bpf_printk("WARNING: Inconsistent tree, node %p is its own left child", rbnode);
+			arena_stdout("WARNING: Inconsistent tree, node %p is its own left child", rbnode);
 			return -EINVAL;
 		}
 
 		if (rbnode->right == rbnode) {
-			bpf_printk("WARNING: Inconsistent tree, node %p is its own right child", rbnode);
+			arena_stdout("WARNING: Inconsistent tree, node %p is its own right child", rbnode);
 			return -EINVAL;
 		}
 
 		if (rbnode->is_red) {
 			if (rbnode->left && rbnode->left->is_red) {
-				bpf_printk("WARNING: Inconsistent tree. Parent has %p has red child %p", rbnode, rbnode->left);
+				arena_stdout("WARNING: Inconsistent tree. Parent has %p has red child %p", rbnode, rbnode->left);
 				return -EINVAL;
 			}
 			if (rbnode->right && rbnode->right->is_red) {
-				bpf_printk("WARNING: Inconsistent tree. Parent has %p has red child %p", rbnode, rbnode->right);
+				arena_stdout("WARNING: Inconsistent tree. Parent has %p has red child %p", rbnode, rbnode->right);
 				return -EINVAL;
 			}
 		} else if (rbnode->parent && rbnode->parent->child[1 - rbnode_dir(rbnode)] == NULL) {
-			bpf_printk("WARNING: Inconsistent tree. Black node %p has no sibling", rbnode);
+			arena_stdout("WARNING: Inconsistent tree. Black node %p has no sibling", rbnode);
 			return -EINVAL;
 		}
 

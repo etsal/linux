@@ -1,13 +1,5 @@
 #pragma once
 
-#ifdef __BPF__
-#include <scx/common.bpf.h>
-#include <bpf_arena_common.bpf.h>
-#include <bpf_arena_spin_lock.h>
-#endif /* __BPF__ */
-
-#include <lib/sdt_task.h>
-
 #define RB_MAXLVL_PRINT (16)
 
 struct rbnode;
@@ -15,7 +7,6 @@ struct rbnode;
 typedef struct rbnode __arena rbnode_t;
 
 struct rbnode {
-	union sdt_id tid;
 	rbnode_t *parent;
 	union {
 		struct {
@@ -34,7 +25,7 @@ struct rbnode {
 	bool is_red;
 };
 
-/* 
+/*
  * Does the rbtree allocate is own nodes, or do they get
  * allocated by the caller?
  */
@@ -65,7 +56,6 @@ enum rbtree_insert_mode {
 };
 
 struct rbtree {
-	union sdt_id tid;
 	rbnode_t *root;
 	rbnode_t *freelist;
 	enum rbtree_alloc alloc;
@@ -73,8 +63,6 @@ struct rbtree {
 };
 
 typedef struct rbtree __arena rbtree_t;
-
-int scx_rb_init(void);
 
 #ifdef __BPF__
 u64 rb_create_internal(enum rbtree_alloc alloc, enum rbtree_insert_mode insert);
