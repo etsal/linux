@@ -16320,8 +16320,13 @@ static int adjust_reg_min_max_vals(struct bpf_verifier_env *env,
 			}
 
 			/* We have a SCALAR_PTR_TO_ARENA operation,
-			 * propagate the info to dst_reg. */
+			 * propagate the info to dst_reg. The only
+			 * field not propagated is subreg_def, because
+			 * the instruction writing to dst_reg is
+			 * this one.
+			 */
 			*dst_reg = *src_reg;
+			dst_reg->subreg_def = env->insn_idx + 1;
 		}
 
 
