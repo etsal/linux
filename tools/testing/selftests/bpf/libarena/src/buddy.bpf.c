@@ -197,7 +197,7 @@ static u8 idx_get_order(buddy_chunk_t *chunk, u64 idx)
 		       "order must fit in 4 bits");
 
 	if (unlikely(idx >= BUDDY_CHUNK_ITEMS)) {
-		arena_stderr("setting order of invalid idx\n");
+		arena_stderr("getting order of invalid idx\n");
 		return BUDDY_CHUNK_NUM_ORDERS;
 	}
 
@@ -211,7 +211,7 @@ static void __arena *idx_to_addr(buddy_chunk_t *chunk, size_t idx)
 	u64 address;
 
 	if (unlikely(idx >= BUDDY_CHUNK_ITEMS)) {
-		arena_stderr("setting order of invalid idx\n");
+		arena_stderr("getting address of invalid idx\n");
 		return NULL;
 	}
 
