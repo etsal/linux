@@ -43,6 +43,12 @@ extern volatile u64 asan_violated;
 
 int arena_fls(__u64 word);
 
+#define malloc(size) (void __arena *)(malloc_internal((size)))
+#define free(ptr) do { free_internal((u64)(ptr)); } while (0)
+
+u64 malloc_internal(size_t size);
+void free_internal(u64 ptr);
+
 #endif /* __BPF__ */
 
 struct arena_get_base_args {

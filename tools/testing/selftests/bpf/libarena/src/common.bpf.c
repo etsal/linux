@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: LGPL-2.1 OR BSD-2-Clause
 /* Copyright (c) 2026 Meta Platforms, Inc. and affiliates. */
 #include <common.h>
+
 #include <asan.h>
+#include <buddy.h>
+
+private(LIBARENA) struct buddy buddy;
+static u64 buddy_lock;
 
 const volatile u32 zero = 0;
 
@@ -61,6 +66,32 @@ SEC("syscall") __weak
 int arena_alloc_reserve(void)
 {
 	return bpf_arena_reserve_pages(&arena, NULL, RESERVE_ALLOC);
+}
+
+SEC("syscall") __weak
+int arena_alloc_init(void)
+{
+	return buddy_init(&buddy, (arena_spinlock_t __arena *)&buddy_lock);
+}
+
+SEC("syscall") __weak
+int arena_alloc_fini(void)
+{
+	buddy_destroy(&buddy);
+
+	return 0;
+}
+
+__weak
+u64 malloc_internal(size_t size)
+{
+	return buddy_alloc_internal(&buddy, size);
+}
+
+__weak
+void free_internal(u64 ptr)
+{
+	buddy_free_internal(&buddy, ptr);
 }
 
 char _license[] SEC("license") = "GPL";
