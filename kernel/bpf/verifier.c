@@ -16329,7 +16329,6 @@ static int adjust_reg_min_max_vals(struct bpf_verifier_env *env,
 			dst_reg->subreg_def = env->insn_idx + 1;
 		}
 
-
 		if (BPF_CLASS(insn->code) == BPF_ALU64)
 			/*
 			 * 32-bit operations zero upper bits automatically.
