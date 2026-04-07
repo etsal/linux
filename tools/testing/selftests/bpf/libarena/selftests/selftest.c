@@ -142,6 +142,7 @@ TEST(test_minheap);
 TEST(test_rbtree);
 TEST(test_btree);
 TEST(test_lvqueue);
+TEST(test_bitmap);
 
 #ifdef BPF_ARENA_ASAN
 TEST(asan_test_buddy);

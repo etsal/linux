@@ -25,6 +25,8 @@
 
 #define private(name) SEC(".data." #name) __hidden __attribute__((aligned(8)))
 
+#define div_round_up(n, d) (((n) + (d) - 1) / (d))
+
 #define ARENA_PAGES (1UL << (32 - __builtin_ffs(__PAGE_SIZE) + 1))
 
 struct {
