@@ -1,9 +1,5 @@
 #pragma once
 
-#include <scx/common.bpf.h>
-#include <bpf_arena_common.bpf.h>
-#include <bpf_arena_spin_lock.h>
-
 #define BT_MAXLVL_PRINT (10)
 #define BT_LEAFSZ 10
 
@@ -28,6 +24,8 @@ struct btree {
 
 typedef struct btree __arena btree_t;
 
+#ifdef __BPF__
+
 u64 bt_create_internal(void);
 #define bt_create() ((btree_t *)(bt_create_internal()))
 
@@ -36,5 +34,7 @@ int bt_insert(btree_t *btree, u64 key, u64 value, bool update);
 int bt_remove(btree_t *btree, u64 key);
 int bt_find(btree_t *btree, u64 key, u64 *value);
 int bt_print(btree_t *btree);
+
+#endif /* __BPF__ */
 
 /* XXXETSAL Iterators */

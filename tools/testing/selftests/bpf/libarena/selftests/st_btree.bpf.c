@@ -1,7 +1,13 @@
-#include <scx/common.bpf.h>
-#include <lib/sdt_task.h>
+/*
+ * SPDX-License-Identifier: GPL-2.0
+ * Copyright (c) 2025-2026 Meta Platforms, Inc. and affiliates.
+ */
 
-#include <lib/btree.h>
+#include <common.h>
+
+#include <asan.h>
+#include <buddy.h>
+#include <btree.h>
 
 #include "selftest.h"
 
@@ -36,7 +42,7 @@ static const u64 morekeys[] = { 173, 636, 1201, 8642, 5957, 3617, 4586, 8053, 65
 	7501, 9514, 394, 2339, 4993, 5606, 6060, 1297, 8273, 3012, 157, 8181, 6765, 7207, 1005, 8833, 1914,
 	7456, 1846, 8375, 2741, 2074, 1712, 5286 };
 
-__weak int scx_selftest_btree_find_nonexistent(btree_t __arg_arena *btree)
+__weak int test_btree_find_nonexistent(btree_t __arg_arena *btree)
 {
 	u64 key = 0xdeadbeef;
 	u64 value = 0;
@@ -53,7 +59,7 @@ __weak int scx_selftest_btree_find_nonexistent(btree_t __arg_arena *btree)
 	return 0;
 }
 
-__weak int scx_selftest_btree_insert_existing(btree_t __arg_arena *btree)
+__weak int test_btree_insert_existing(btree_t __arg_arena *btree)
 {
 	u64 key = 525252;
 	u64 value = 24;
@@ -76,7 +82,7 @@ __weak int scx_selftest_btree_insert_existing(btree_t __arg_arena *btree)
 	return 0;
 }
 
-__weak int scx_selftest_btree_update_existing(btree_t __arg_arena *btree)
+__weak int test_btree_update_existing(btree_t __arg_arena *btree)
 {
 	u64 key = 33333;
 	u64 value;
@@ -117,7 +123,7 @@ __weak int scx_selftest_btree_update_existing(btree_t __arg_arena *btree)
 }
 
 
-__weak int scx_selftest_btree_insert_one(btree_t __arg_arena *btree)
+__weak int test_btree_insert_one(btree_t __arg_arena *btree)
 {
 	u64 key = 202020;
 	u64 value = 0xbadcafe;
@@ -137,7 +143,7 @@ __weak int scx_selftest_btree_insert_one(btree_t __arg_arena *btree)
 	return 0;
 }
 
-__weak int scx_selftest_btree_insert_ten(btree_t __arg_arena *btree)
+__weak int test_btree_insert_ten(btree_t __arg_arena *btree)
 {
 	u64 key, value;
 	int ret, i;
@@ -175,7 +181,7 @@ __weak int scx_selftest_btree_insert_ten(btree_t __arg_arena *btree)
 	return 0;
 }
 
-__weak int scx_selftest_btree_insert_many(btree_t __arg_arena *btree)
+__weak int test_btree_insert_many(btree_t __arg_arena *btree)
 {
 	const size_t numkeys = sizeof(keys) / sizeof(keys[0]);
 	u64 key, value;
@@ -215,7 +221,7 @@ __weak int scx_selftest_btree_insert_many(btree_t __arg_arena *btree)
 	return 0;
 }
 
-__weak int scx_selftest_btree_remove_one(btree_t __arg_arena *btree)
+__weak int test_btree_remove_one(btree_t __arg_arena *btree)
 {
 	u64 key = 20, value = 5, newvalue;
 	int ret;
@@ -243,12 +249,10 @@ __weak int scx_selftest_btree_remove_one(btree_t __arg_arena *btree)
 	if (!ret)
 		return 6;
 
-
-
 	return 0;
 }
 
-__weak int scx_selftest_btree_remove_many(btree_t __arg_arena *btree)
+__weak int test_btree_remove_many(btree_t __arg_arena *btree)
 {
 	const size_t numkeys = sizeof(morekeys) / sizeof(morekeys[0]);
 	u64 key, value;
@@ -303,7 +307,7 @@ __weak int scx_selftest_btree_remove_many(btree_t __arg_arena *btree)
 		key = morekeys[i];
 		ret = bt_remove(btree, key);
 		if (ret) {
-			bpf_printk("Failed to remove %ld", key);
+			arena_stdout("Failed to remove %ld", key);
 			return errval;
 		}
 
@@ -358,7 +362,7 @@ __weak int scx_selftest_btree_remove_many(btree_t __arg_arena *btree)
 	return 0;
 }
 
-__weak int scx_selftest_btree_add_remove_circular(btree_t __arg_arena *btree)
+__weak int test_btree_add_remove_circular(btree_t __arg_arena *btree)
 {
 	const size_t iters = 60;
 	const size_t prefill = 10;
@@ -400,7 +404,7 @@ __weak int scx_selftest_btree_add_remove_circular(btree_t __arg_arena *btree)
 
 		ret = bt_find(btree, key, &value);
 		if (!ret) {
-			bpf_printk("Key %d already present", key);
+			arena_stdout("Key %d already present", key);
 			return errval;
 		}
 
@@ -441,7 +445,7 @@ __weak int scx_selftest_btree_add_remove_circular(btree_t __arg_arena *btree)
 	return 0;
 }
 
-__weak int scx_selftest_btree_add_remove_circular_reverse(btree_t __arg_arena *btree)
+__weak int test_btree_add_remove_circular_reverse(btree_t __arg_arena *btree)
 {
 	const size_t iters = 60;
 	const size_t prefill = 10;
@@ -483,7 +487,7 @@ __weak int scx_selftest_btree_add_remove_circular_reverse(btree_t __arg_arena *b
 
 		ret = bt_find(btree, key, &value);
 		if (!ret) {
-			bpf_printk("Key %d already present", key);
+			arena_stdout("Key %d already present", key);
 			return errval;
 		}
 
@@ -491,7 +495,7 @@ __weak int scx_selftest_btree_add_remove_circular_reverse(btree_t __arg_arena *b
 
 		ret = bt_insert(btree, key, i, true);
 		if (ret) {
-			bpf_printk("error %d on insert", ret);
+			arena_stdout("error %d on insert", ret);
 			bt_print(btree);
 			return errval;
 		}
@@ -526,10 +530,11 @@ __weak int scx_selftest_btree_add_remove_circular_reverse(btree_t __arg_arena *b
 }
 
 
-#define SCX_BTREE_SELFTEST(suffix) SCX_SELFTEST(scx_selftest_btree_ ## suffix, btree)
+#define BTREE_SELFTEST(suffix) SELFTEST(test_btree_ ## suffix, btree)
 
+SEC("syscall")
 __weak
-int scx_selftest_btree(void)
+int test_btree(void)
 {
 	btree_t __arg_arena *btree;
 
@@ -540,16 +545,16 @@ int scx_selftest_btree(void)
 	/* Keep it in to check for verification failures. */
 	bt_print(btree);
 
-	SCX_BTREE_SELFTEST(find_nonexistent);
-	SCX_BTREE_SELFTEST(insert_one);
-	SCX_BTREE_SELFTEST(insert_existing);
-	SCX_BTREE_SELFTEST(update_existing);
-	SCX_BTREE_SELFTEST(insert_ten);
-	SCX_BTREE_SELFTEST(insert_many);
-	SCX_BTREE_SELFTEST(remove_one);
-	SCX_BTREE_SELFTEST(remove_many);
-	SCX_BTREE_SELFTEST(add_remove_circular_reverse);
-	SCX_BTREE_SELFTEST(add_remove_circular);
+	BTREE_SELFTEST(find_nonexistent);
+	BTREE_SELFTEST(insert_one);
+	BTREE_SELFTEST(insert_existing);
+	BTREE_SELFTEST(update_existing);
+	BTREE_SELFTEST(insert_ten);
+	BTREE_SELFTEST(insert_many);
+	BTREE_SELFTEST(remove_one);
+	BTREE_SELFTEST(remove_many);
+	BTREE_SELFTEST(add_remove_circular_reverse);
+	BTREE_SELFTEST(add_remove_circular);
 
 	return 0;
 }

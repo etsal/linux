@@ -1,13 +1,13 @@
 /*
  * SPDX-License-Identifier: GPL-2.0
- * Copyright (c) 2025 Meta Platforms, Inc. and affiliates.
- * Copyright (c) 2025 Emil Tsalapatis <etsal@meta.com>
+ * Copyright (c) 2025-2026 Meta Platforms, Inc. and affiliates.
  */
 
-#include <scx/common.bpf.h>
+#include <common.h>
 
-#include <lib/sdt_task.h>
-#include <lib/btree.h>
+#include <asan.h>
+#include <buddy.h>
+#include <btree.h>
 
 #define BTREE_MAX_DEPTH (20)
 
@@ -55,7 +55,7 @@ static bt_node *btnode_alloc(btree_t *btree, bt_node __arg_arena *parent, u64 fl
 	} while (cmpxchg(&btree->freelist, btn, btn->parent) != btn && can_loop);
 
 	if (!btn)
-		btn = scx_static_alloc(sizeof(*btn), 1);
+		btn = malloc(sizeof(*btn));
 	if (!btn)
 		return NULL;
 
@@ -92,14 +92,14 @@ u64 bt_create_internal(void)
 {
 	btree_t __arg_arena *btree;
 
-	btree = scx_static_alloc(sizeof(*btree), 1);
+	btree = malloc(sizeof(*btree));
 	if (!btree)
 		return (u64)NULL;
 
+	btree->freelist = NULL;
 	btree->root = btnode_alloc(btree, NULL, BT_F_LEAF);
 	if (!btree->root) {
-		/* XXX Fix once we use the buddy allocator. */
-		//scx_buddy_free(buddy, btree);
+		free(btree);
 		return (u64)NULL;
 	}
 
@@ -170,7 +170,7 @@ int btnode_remove_internal(bt_node __arg_arena *btn, u64 ind)
 
 	/* We can have to btn->numkeys - 1 keys and btn->numkeys values.*/
 	if (unlikely(ind > btn->numkeys)) {
-		bpf_printk("internal removal overflow (%ld, %ld)", ind, btn->numkeys - 1);
+		arena_stdout("internal removal overflow (%ld, %ld)", ind, btn->numkeys - 1);
 		return -EINVAL;
 	}
 
@@ -204,7 +204,7 @@ int btnode_add_internal(bt_node __arg_arena *btn, u64 ind, u64 key, bt_node __ar
 
 	/* We can have up to BT_LEAFSZ - 1 keys and BT_LEAFSZ values.*/
 	if (unlikely(ind > btn->numkeys || btn->numkeys >= BT_LEAFSZ - 1))  {
-		bpf_printk("internal add overflow (%ld, %ld)", ind, btn->numkeys);
+		arena_stdout("internal add overflow (%ld, %ld)", ind, btn->numkeys);
 		btnode_print_path(btn);
 		return -EINVAL;
 	}
@@ -237,7 +237,7 @@ static int btnode_remove_leaf(bt_node *btn, u64 ind)
 	u64 nelems;
 
 	if (unlikely(ind >= btn->numkeys)) {
-		bpf_printk("leaf remove overflow (%ld, %ld)", ind, btn->numkeys);
+		arena_stdout("leaf remove overflow (%ld, %ld)", ind, btn->numkeys);
 		return -EINVAL;
 	}
 
@@ -260,7 +260,7 @@ static int btnode_add_leaf(bt_node *btn, u64 ind, u64 key, u64 value)
 	u64 nelems;
 
 	if (unlikely(ind > btn->numkeys)) {
-		bpf_printk("leaf add overflow (%ld,  %ld)", ind, btn->numkeys);
+		arena_stdout("leaf add overflow (%ld,  %ld)", ind, btn->numkeys);
 		return -EINVAL;
 	}
 
@@ -386,7 +386,7 @@ int bt_split(btree_t __arg_arena *btree, bt_node __arg_arena *btn_old)
 	}
 
 	if (btn_old->numkeys >= BT_LEAFSZ - 1) {
-		bpf_printk("POST SPLIT NODE IS FULL");
+		arena_stdout("POST SPLIT NODE IS FULL");
 		return -E2BIG;
 	}
 
@@ -417,7 +417,7 @@ int bt_insert(btree_t __arg_arena *btree, u64 key, u64 value, bool update)
 
 	/* Integrity check, node splitting should prevent this. */
 	if (unlikely(btn->numkeys >= BT_LEAFSZ)) {
-		bpf_printk("node overflow");
+		arena_stdout("node overflow");
 		return -EINVAL;
 	}
 
@@ -488,7 +488,7 @@ static inline bool bt_balance(bt_node __arg_arena *btn, bt_node __arg_arena *par
 
 	if (!bt_balance_left(parent, ind - 1, sibling, btn)) {
 		if (unlikely(sibling->numkeys >= BT_LEAFSZ - 1 || btn->numkeys >= BT_LEAFSZ - 1))
-			bpf_printk("BTREE ERROR: FULL NODE AFTER LEFT BALANCING");
+			arena_stdout("BTREE ERROR: FULL NODE AFTER LEFT BALANCING");
 
 		return true;
 	}
@@ -506,7 +506,7 @@ steal_right:
 
 	ret = bt_balance_right(parent, ind, btn, sibling);
 	if (unlikely(sibling->numkeys >= BT_LEAFSZ - 1 || btn->numkeys >= BT_LEAFSZ - 1))
-		bpf_printk("BTREE ERROR: FULL NODE AFTER LEFT BALANCING");
+		arena_stdout("BTREE ERROR: FULL NODE AFTER LEFT BALANCING");
 
 	return ret == 0;
 }
@@ -551,7 +551,7 @@ static inline int bt_merge(btree_t *btree, bt_node *btn, bt_node *parent, int in
 	btnode_free(btree, right);
 
 	if (unlikely(left->numkeys == BT_LEAFSZ - 1))
-		bpf_printk("BTREE ERROR: FULL NODE AFTER MERGING");
+		arena_stdout("BTREE ERROR: FULL NODE AFTER MERGING");
 
 	return 0;
 }
@@ -575,7 +575,7 @@ int bt_rebalance(btree_t __arg_arena *btree, bt_node __arg_arena *parent, bt_nod
 		return ret;
 
 	if (unlikely(btn->numkeys >= BT_LEAFSZ - 1))
-		bpf_printk("BTREE ERROR: FULL INTERNAL NODE AFTER REBALANCE");
+		arena_stdout("BTREE ERROR: FULL INTERNAL NODE AFTER REBALANCE");
 
 	return 0;
 }
@@ -667,19 +667,19 @@ int btnode_print(u64 depth, u64 ind, bt_node __arg_arena *btn)
 {
 	bool isleaf = btnode_isleaf(btn);
 
-	bpf_printk("==== [%ld/%ld] BTREE %s %p PARENT %p====", depth, ind,
+	arena_stdout("==== [%ld/%ld] BTREE %s %p PARENT %p====", depth, ind,
 			isleaf ? "LEAF" : "NODE", btn, btn->parent);
 
 	/* Hardcode it for now make it nicer once we use streams. */
 	_Static_assert(BT_LEAFSZ == 10, "Unexpected btree fanout");
 
-	bpf_printk("[KEY] %ld %ld %ld %ld %ld %ld %ld %ld %ld %ld",
+	arena_stdout("[KEY] %ld %ld %ld %ld %ld %ld %ld %ld %ld %ld",
 			btn->keys[0], btn->keys[1], btn->keys[2],
 			btn->keys[3], btn->keys[4], btn->keys[5],
 			btn->keys[6], btn->keys[7], btn->keys[8],
 			btn->keys[9]);
 	if (isleaf) {
-		bpf_printk("[VAL] %ld %ld %ld %ld %ld %ld %ld %ld %ld %ld",
+		arena_stdout("[VAL] %ld %ld %ld %ld %ld %ld %ld %ld %ld %ld",
 				btn->values[0], btn->values[1], btn->values[2],
 				btn->values[3], btn->values[4], btn->values[5],
 				btn->values[6], btn->values[7], btn->values[8],
@@ -689,7 +689,7 @@ int btnode_print(u64 depth, u64 ind, bt_node __arg_arena *btn)
 		 * We're typecasting to pointers to actually get the value we
 		 * see during execution.
 		 */
-		bpf_printk("[VAL] 0x%p 0x%p 0x%p 0x%p 0x%p 0x%p 0x%p 0x%p 0x%p 0x%p",
+		arena_stdout("[VAL] 0x%p 0x%p 0x%p 0x%p 0x%p 0x%p 0x%p 0x%p 0x%p 0x%p",
 				(bt_node *)btn->values[0], (bt_node *)btn->values[1],
 				(bt_node *)btn->values[2], (bt_node *)btn->values[3],
 				(bt_node *)btn->values[4], (bt_node *)btn->values[5],
@@ -697,7 +697,7 @@ int btnode_print(u64 depth, u64 ind, bt_node __arg_arena *btn)
 				(bt_node *)btn->values[8], (bt_node *)btn->values[9]);
 	}
 
-	bpf_printk("");
+	arena_stdout("");
 
 	return 0;
 }
@@ -728,7 +728,7 @@ int bt_print(btree_t __arg_arena *btree)
 	depth = 0;
 	ind = 0;
 
-	bpf_printk("=== BPF PRINTK START ===");
+	arena_stdout("=== BPF PRINTK START ===");
 
 	btnode_print(depth, ind, btn);
 
@@ -750,7 +750,7 @@ int bt_print(btree_t __arg_arena *btree)
 			ind = 0;
 
 			if (depth >= BT_MAXLVL_PRINT) {
-				bpf_printk("Max level reached, aborting btree print.");
+				arena_stdout("Max level reached, aborting btree print.");
 				return 0;
 			}
 
@@ -772,7 +772,7 @@ int bt_print(btree_t __arg_arena *btree)
 		}
 	}
 
-	bpf_printk("=== BPF PRINTK END ===");
+	arena_stdout("=== BPF PRINTK END ===");
 
 	return 0;
 }
