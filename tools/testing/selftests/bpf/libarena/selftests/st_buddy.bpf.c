@@ -213,16 +213,16 @@ static int test_buddy_alignment(void)
 	return 0;
 }
 
-#define BUDDY_ALLOC_SELFTEST(suffix) ALLOC_SELFTEST(test_buddy_##suffix)
+#define BUDDY_SELFTEST(suffix) SELFTEST(test_buddy_##suffix)
 
 SEC("syscall")
 __weak int test_buddy(void)
 {
-	BUDDY_ALLOC_SELFTEST(create);
-	BUDDY_ALLOC_SELFTEST(alloc);
-	BUDDY_ALLOC_SELFTEST(alloc_free);
-	BUDDY_ALLOC_SELFTEST(alloc_multiple);
-	BUDDY_ALLOC_SELFTEST(alignment);
+	BUDDY_SELFTEST(create);
+	BUDDY_SELFTEST(alloc);
+	BUDDY_SELFTEST(alloc_free);
+	BUDDY_SELFTEST(alloc_multiple);
+	BUDDY_SELFTEST(alignment);
 
 	return 0;
 }

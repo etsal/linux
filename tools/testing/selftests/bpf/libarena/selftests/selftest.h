@@ -2,7 +2,7 @@
 /* Copyright (c) 2026 Meta Platforms, Inc. and affiliates. */
 #pragma once
 
-#define ALLOC_SELFTEST(func, ...)		\
+#define SELFTEST(func, ...)		\
 	do {				\
 		int ret = func(__VA_ARGS__);	\
 		if (ret) {		\
