@@ -2,6 +2,8 @@
 /* Copyright (c) 2026 Meta Platforms, Inc. and affiliates. */
 #pragma once
 
+#define __used __attribute__((used))
+
 struct asan_init_args {
 	u64 arena_all_pages;
 	u64 arena_globals_pages;
@@ -51,47 +53,19 @@ bool asan_shadow_set(void __arena *addr);
  * separately. The runtime calls are injected into the LLVM IR file
  */
 #define DECLARE_ASAN_LOAD_STORE_SIZE(size)				\
-	void __asan_store##size(void *addr);				\
-	void __asan_store##size##_noabort(void *addr);	\
-	void __asan_load##size(void *addr);				\
-	void __asan_load##size##_noabort(void *addr);	\
-	void __asan_report_store##size(void *addr);			\
-	void __asan_report_store##size##_noabort(void *addr);		\
-	void __asan_report_load##size(void *addr);			\
-	void __asan_report_load##size##_noabort(void *addr);
+	void __used __asan_store##size(void *addr);				\
+	void __used __asan_store##size##_noabort(void *addr);	\
+	void __used __asan_load##size(void *addr);				\
+	void __used __asan_load##size##_noabort(void *addr);	\
+	void __used __asan_report_store##size(void *addr);			\
+	void __used __asan_report_store##size##_noabort(void *addr);		\
+	void __used __asan_report_load##size(void *addr);			\
+	void __used __asan_report_load##size##_noabort(void *addr);
 
 DECLARE_ASAN_LOAD_STORE_SIZE(1);
 DECLARE_ASAN_LOAD_STORE_SIZE(2);
 DECLARE_ASAN_LOAD_STORE_SIZE(4);
 DECLARE_ASAN_LOAD_STORE_SIZE(8);
-
-/*
- * Force LLVM to emit BTF information for the stubs,
- * because the ASAN pass in LLVM by itself doesn't.
- */
-#define ASAN_LOAD_STORE_SIZE(size)		\
-	__asan_store##size,			\
-	__asan_store##size##_noabort,		\
-	__asan_load##size,			\
-	__asan_load##size##_noabort,		\
-	__asan_report_store##size,		\
-	__asan_report_store##size##_noabort,	\
-	__asan_report_load##size,		\
-	__asan_report_load##size##_noabort
-
-/*
- * Force LLVM to generate BTF information for the ASAN function
- * declarations without invoking them. The used attribute prevents
- * the function pointer table from being optimized out by the
- * compiler.
- */
-__attribute__((used))
-static void (*__asan_btf_anchors[])(void *) = {
-	ASAN_LOAD_STORE_SIZE(1),
-	ASAN_LOAD_STORE_SIZE(2),
-	ASAN_LOAD_STORE_SIZE(4),
-	ASAN_LOAD_STORE_SIZE(8)
-};
 
 #else /* BPF_ARENA_ASAN */
 
