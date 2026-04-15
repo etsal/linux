@@ -119,10 +119,40 @@ enum folio_references {
 
 extern int vm_swappiness;
 
+/* for_each_managed_zone_pgdat - helper macro to iterate over all managed zones in a pgdat up to
+ * and including the specified highidx
+ * @zone: The current zone in the iterator
+ * @pgdat: The pgdat which node_zones are being iterated
+ * @idx: The index variable
+ * @highidx: The index of the highest zone to return
+ *
+ * This macro iterates through all managed zones up to and including the specified highidx.
+ * The zone iterator enters an invalid state after macro call and must be reinitialized
+ * before it can be used again.
+ */
+#define for_each_managed_zone_pgdat(zone, pgdat, idx, highidx)	\
+	for ((idx) = 0, (zone) = (pgdat)->node_zones;		\
+	    (idx) <= (highidx);					\
+	    (idx)++, (zone)++)					\
+		if (!managed_zone(zone))			\
+			continue;				\
+		else
+
+/* LRU_GEN */
+
 void lru_gen_age_node(struct pglist_data *pgdat, struct scan_control *sc);
 void lru_gen_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc);
 void lru_gen_shrink_node(struct pglist_data *pgdat, struct scan_control *sc);
 enum folio_references lru_gen_folio_check_references(struct folio *folio,
+						  struct scan_control *sc);
+
+/* LRU */
+
+void lru_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc);
+void lru_shrink_node(pg_data_t *pgdat, struct scan_control *sc);
+void lru_snapshot_refaults(struct mem_cgroup *target_memcg, pg_data_t *pgdat);
+void lru_age_node(struct pglist_data *pgdat, struct scan_control *sc);
+enum folio_references lru_folio_check_references(struct folio *folio,
 						  struct scan_control *sc);
 
 /* COMMON */
@@ -157,7 +187,7 @@ static inline bool can_reclaim_anon_pages(struct mem_cgroup *memcg,
 
 #ifdef CONFIG_MEMCG
 /* Returns true for reclaim through cgroup limits or cgroup interfaces. */
-static bool cgroup_reclaim(struct scan_control *sc)
+static inline bool cgroup_reclaim(struct scan_control *sc)
 {
 	return sc->target_mem_cgroup;
 }
@@ -166,31 +196,51 @@ static bool cgroup_reclaim(struct scan_control *sc)
  * Returns true for reclaim on the root cgroup. This is true for direct
  * allocator reclaim and reclaim through cgroup interfaces on the root cgroup.
  */
-static bool root_reclaim(struct scan_control *sc)
+static inline bool root_reclaim(struct scan_control *sc)
 {
 	return !sc->target_mem_cgroup || mem_cgroup_is_root(sc->target_mem_cgroup);
 }
 
-static int sc_swappiness(struct scan_control *sc, struct mem_cgroup *memcg)
+static inline int sc_swappiness(struct scan_control *sc, struct mem_cgroup *memcg)
 {
 	if (sc->proactive && sc->proactive_swappiness)
 		return *sc->proactive_swappiness;
 	return mem_cgroup_swappiness(memcg);
 }
+
+/**
+ * writeback_throttling_sane - is the usual dirty throttling mechanism available?
+ * @sc: scan_control in question
+ */
+static inline bool writeback_throttling_sane(struct scan_control *sc)
+{
+	if (!cgroup_reclaim(sc))
+		return true;
+#ifdef CONFIG_CGROUP_WRITEBACK
+	if (cgroup_subsys_on_dfl(memory_cgrp_subsys))
+		return true;
+#endif
+	return false;
+}
 #else
-static bool cgroup_reclaim(struct scan_control *sc)
+static inline bool cgroup_reclaim(struct scan_control *sc)
 {
 	return false;
 }
 
-static bool root_reclaim(struct scan_control *sc)
+static inline bool root_reclaim(struct scan_control *sc)
 {
 	return true;
 }
 
-static int sc_swappiness(struct scan_control *sc, struct mem_cgroup *memcg)
+static inline int sc_swappiness(struct scan_control *sc, struct mem_cgroup *memcg)
 {
 	return READ_ONCE(vm_swappiness);
+}
+
+static inline bool writeback_throttling_sane(struct scan_control *sc)
+{
+	return true;
 }
 #endif
 
@@ -207,3 +257,4 @@ unsigned int shrink_folio_list(struct list_head *folio_list,
 		struct mem_cgroup *memcg);
 void set_task_reclaim_state(struct task_struct *task,
 				   struct reclaim_state *rs);
+void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc);
