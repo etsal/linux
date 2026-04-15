@@ -676,7 +676,7 @@ void folio_putback_lru(struct folio *folio)
 	folio_put(folio);		/* drop ref from isolate */
 }
 
-static enum folio_references folio_check_references(struct folio *folio,
+static enum folio_references lru_folio_check_references(struct folio *folio,
 						  struct scan_control *sc)
 {
 	int referenced_ptes, referenced_folio;
@@ -1048,7 +1048,7 @@ retry:
 		if (lru_gen_enabled())
 			references = lru_gen_folio_check_references(folio, sc);
 		else
-			references = folio_check_references(folio, sc);
+			references = lru_folio_check_references(folio, sc);
 
 ignore_refcheck:
 		switch (references) {
@@ -2109,13 +2109,10 @@ enum scan_balance {
 	SCAN_FILE,
 };
 
-static void prepare_scan_control(pg_data_t *pgdat, struct scan_control *sc)
+static void lru_prepare_scan_control(pg_data_t *pgdat, struct scan_control *sc)
 {
 	unsigned long file;
 	struct lruvec *target_lruvec;
-
-	if (lru_gen_enabled())
-		return;
 
 	target_lruvec = mem_cgroup_lruvec(sc->target_mem_cgroup, pgdat);
 
@@ -2451,7 +2448,7 @@ static bool can_age_anon_pages(struct lruvec *lruvec,
 			  lruvec_memcg(lruvec));
 }
 
-void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+static void lru_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 {
 	unsigned long nr[NR_LRU_LISTS];
 	unsigned long targets[NR_LRU_LISTS];
@@ -2461,11 +2458,6 @@ void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 	unsigned long nr_to_reclaim = sc->nr_to_reclaim;
 	bool proportional_reclaim;
 	struct blk_plug plug;
-
-	if (lru_gen_enabled() && !root_reclaim(sc)) {
-		lru_gen_shrink_lruvec(lruvec, sc);
-		return;
-	}
 
 	get_scan_count(lruvec, sc, nr);
 
@@ -2567,6 +2559,14 @@ void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 	    inactive_is_low(lruvec, LRU_INACTIVE_ANON))
 		shrink_active_list(SWAP_CLUSTER_MAX, lruvec,
 				   sc, LRU_ACTIVE_ANON);
+}
+
+static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+{
+	if (lru_gen_enabled() && !root_reclaim(sc))
+		lru_gen_shrink_lruvec(lruvec, sc);
+	else
+		lru_shrink_lruvec(lruvec, sc);
 }
 
 /* Use reclaim/compaction for costly allocs or under memory pressure */
@@ -2718,17 +2718,12 @@ static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
 	} while ((memcg = mem_cgroup_iter(target_memcg, memcg, partial)));
 }
 
-static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
+static void lru_shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 {
 	unsigned long nr_reclaimed, nr_scanned, nr_node_reclaimed;
 	struct lruvec *target_lruvec;
 	bool reclaimable = false;
 
-	if (lru_gen_enabled() && root_reclaim(sc)) {
-		memset(&sc->nr, 0, sizeof(sc->nr));
-		lru_gen_shrink_node(pgdat, sc);
-		return;
-	}
 
 	target_lruvec = mem_cgroup_lruvec(sc->target_mem_cgroup, pgdat);
 
@@ -2738,7 +2733,8 @@ again:
 	nr_reclaimed = sc->nr_reclaimed;
 	nr_scanned = sc->nr_scanned;
 
-	prepare_scan_control(pgdat, sc);
+	if (!lru_gen_enabled())
+		lru_prepare_scan_control(pgdat, sc);
 
 	shrink_node_memcgs(pgdat, sc);
 
@@ -2826,6 +2822,16 @@ again:
 		kswapd_try_clear_hopeless(pgdat, sc->order, sc->reclaim_idx);
 	else if (sc->cache_trim_mode)
 		sc->cache_trim_mode_failed = 1;
+}
+
+static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
+{
+	if (lru_gen_enabled() && root_reclaim(sc)) {
+		memset(&sc->nr, 0, sizeof(sc->nr));
+		lru_gen_shrink_node(pgdat, sc);
+	} else {
+		lru_shrink_node(pgdat, sc);
+	}
 }
 
 /*
@@ -2992,13 +2998,10 @@ static void shrink_zones(struct zonelist *zonelist, struct scan_control *sc)
 	sc->gfp_mask = orig_mask;
 }
 
-static void snapshot_refaults(struct mem_cgroup *target_memcg, pg_data_t *pgdat)
+static void lru_snapshot_refaults(struct mem_cgroup *target_memcg, pg_data_t *pgdat)
 {
 	struct lruvec *target_lruvec;
 	unsigned long refaults;
-
-	if (lru_gen_enabled())
-		return;
 
 	target_lruvec = mem_cgroup_lruvec(target_memcg, pgdat);
 	refaults = lruvec_page_state(target_lruvec, WORKINGSET_ACTIVATE_ANON);
@@ -3057,7 +3060,9 @@ retry:
 			continue;
 		last_pgdat = zone->zone_pgdat;
 
-		snapshot_refaults(sc->target_mem_cgroup, zone->zone_pgdat);
+
+		if (!lru_gen_enabled())
+			lru_snapshot_refaults(sc->target_mem_cgroup, zone->zone_pgdat);
 
 		if (cgroup_reclaim(sc)) {
 			struct lruvec *lruvec;
@@ -3381,15 +3386,10 @@ unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,
 }
 #endif
 
-static void kswapd_age_node(struct pglist_data *pgdat, struct scan_control *sc)
+static void lru_age_node(struct pglist_data *pgdat, struct scan_control *sc)
 {
 	struct mem_cgroup *memcg;
 	struct lruvec *lruvec;
-
-	if (lru_gen_enabled()) {
-		lru_gen_age_node(pgdat, sc);
-		return;
-	}
 
 	lruvec = mem_cgroup_lruvec(NULL, pgdat);
 	if (!can_age_anon_pages(lruvec, sc))
@@ -3735,7 +3735,10 @@ restart:
 		 * referenced before reclaiming. All pages are rotated
 		 * regardless of classzone as this is about consistent aging.
 		 */
-		kswapd_age_node(pgdat, &sc);
+		if (lru_gen_enabled())
+			lru_gen_age_node(pgdat, &sc);
+		else
+			lru_age_node(pgdat, &sc);
 
 		/* Call soft limit reclaim before calling shrink_node. */
 		sc.nr_scanned = 0;
@@ -3833,7 +3836,9 @@ out:
 		wakeup_kcompactd(pgdat, pageblock_order, highest_zoneidx);
 	}
 
-	snapshot_refaults(NULL, pgdat);
+	if (!lru_gen_enabled())
+		lru_snapshot_refaults(NULL, pgdat);
+
 	__fs_reclaim_release(_THIS_IP_);
 	psi_memstall_leave(&pflags);
 	set_task_reclaim_state(current, NULL);

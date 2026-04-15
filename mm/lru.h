@@ -127,7 +127,6 @@ enum folio_references lru_gen_folio_check_references(struct folio *folio,
 
 /* COMMON */
 
-void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc);
 bool can_demote(int nid, struct scan_control *sc,
 		       struct mem_cgroup *memcg);
 
