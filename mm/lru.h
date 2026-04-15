@@ -257,4 +257,5 @@ unsigned int shrink_folio_list(struct list_head *folio_list,
 		struct mem_cgroup *memcg);
 void set_task_reclaim_state(struct task_struct *task,
 				   struct reclaim_state *rs);
-void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc);
+void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc);
+bool pgdat_balanced(pg_data_t *pgdat, int order, int highest_zoneidx);
