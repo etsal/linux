@@ -676,13 +676,6 @@ void folio_putback_lru(struct folio *folio)
 	folio_put(folio);		/* drop ref from isolate */
 }
 
-enum folio_references {
-	FOLIOREF_RECLAIM,
-	FOLIOREF_RECLAIM_CLEAN,
-	FOLIOREF_KEEP,
-	FOLIOREF_ACTIVATE,
-};
-
 static enum folio_references folio_check_references(struct folio *folio,
 						  struct scan_control *sc)
 {
@@ -707,13 +700,6 @@ static enum folio_references folio_check_references(struct folio *folio,
 	 */
 	if (referenced_ptes == -1)
 		return FOLIOREF_KEEP;
-
-	if (lru_gen_enabled()) {
-		if (!referenced_ptes)
-			return FOLIOREF_RECLAIM;
-
-		return lru_gen_set_refs(folio) ? FOLIOREF_ACTIVATE : FOLIOREF_KEEP;
-	}
 
 	referenced_folio = folio_test_clear_referenced(folio);
 
@@ -1056,9 +1042,15 @@ retry:
 			}
 		}
 
-		if (!ignore_references)
+		if (ignore_references)
+			goto ignore_refcheck;
+
+		if (lru_gen_enabled())
+			references = lru_gen_folio_check_references(folio, sc);
+		else
 			references = folio_check_references(folio, sc);
 
+ignore_refcheck:
 		switch (references) {
 		case FOLIOREF_ACTIVATE:
 			goto activate_locked;

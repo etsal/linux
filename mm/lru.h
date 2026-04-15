@@ -110,37 +110,20 @@ struct scan_control {
 	struct reclaim_state reclaim_state;
 };
 
+enum folio_references {
+	FOLIOREF_RECLAIM,
+	FOLIOREF_RECLAIM_CLEAN,
+	FOLIOREF_KEEP,
+	FOLIOREF_ACTIVATE,
+};
+
 extern int vm_swappiness;
-
-#ifdef CONFIG_LRU_GEN
-/*
- * Only used on a mapped folio in the eviction (rmap walk) path, where promotion
- * needs to be done by taking the folio off the LRU list and then adding it back
- * with PG_active set. In contrast, the aging (page table walk) path uses
- * folio_update_gen().
- */
-static bool lru_gen_set_refs(struct folio *folio)
-{
-	/* see the comment on LRU_REFS_FLAGS */
-	if (!folio_test_referenced(folio) && !folio_test_workingset(folio)) {
-		set_mask_bits(&folio->flags.f, LRU_REFS_MASK, BIT(PG_referenced));
-		return false;
-	}
-
-	set_mask_bits(&folio->flags.f, LRU_REFS_FLAGS, BIT(PG_workingset));
-	return true;
-}
-#else
-static bool lru_gen_set_refs(struct folio *folio)
-{
-	return false;
-}
-#endif /* CONFIG_LRU_GEN */
 
 void lru_gen_age_node(struct pglist_data *pgdat, struct scan_control *sc);
 void lru_gen_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc);
 void lru_gen_shrink_node(struct pglist_data *pgdat, struct scan_control *sc);
-
+enum folio_references lru_gen_folio_check_references(struct folio *folio,
+						  struct scan_control *sc);
 
 /* COMMON */
 

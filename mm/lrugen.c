@@ -867,6 +867,55 @@ static bool suitable_to_scan(int total, int young)
 	return young * n >= total;
 }
 
+/*
+ * Only used on a mapped folio in the eviction (rmap walk) path, where promotion
+ * needs to be done by taking the folio off the LRU list and then adding it back
+ * with PG_active set. In contrast, the aging (page table walk) path uses
+ * folio_update_gen().
+ */
+static bool lru_gen_set_refs(struct folio *folio)
+{
+	/* see the comment on LRU_REFS_FLAGS */
+	if (!folio_test_referenced(folio) && !folio_test_workingset(folio)) {
+		set_mask_bits(&folio->flags.f, LRU_REFS_MASK, BIT(PG_referenced));
+		return false;
+	}
+
+	set_mask_bits(&folio->flags.f, LRU_REFS_FLAGS, BIT(PG_workingset));
+	return true;
+}
+
+enum folio_references lru_gen_folio_check_references(struct folio *folio,
+						  struct scan_control *sc)
+{
+	int referenced_ptes;
+	vm_flags_t vm_flags;
+
+	referenced_ptes = folio_referenced(folio, 1, sc->target_mem_cgroup,
+					   &vm_flags);
+
+	/*
+	 * The supposedly reclaimable folio was found to be in a VM_LOCKED vma.
+	 * Let the folio, now marked Mlocked, be moved to the unevictable list.
+	 */
+	if (vm_flags & VM_LOCKED)
+		return FOLIOREF_ACTIVATE;
+
+	/*
+	 * There are two cases to consider.
+	 * 1) Rmap lock contention: rotate.
+	 * 2) Skip the non-shared swapbacked folio mapped solely by
+	 *    the exiting or OOM-reaped process.
+	 */
+	if (referenced_ptes == -1)
+		return FOLIOREF_KEEP;
+
+	if (!referenced_ptes)
+		return FOLIOREF_RECLAIM;
+
+	return lru_gen_set_refs(folio) ? FOLIOREF_ACTIVATE : FOLIOREF_KEEP;
+}
+
 static void walk_update_folio(struct lru_gen_mm_walk *walk, struct folio *folio,
 			      int new_gen, bool dirty)
 {
