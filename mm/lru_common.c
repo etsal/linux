@@ -1311,10 +1311,12 @@ unsigned long apply_proportional_protection(struct mem_cgroup *memcg,
 
 void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 {
-	if (lru_gen_enabled() && !root_reclaim(sc))
+	if (lru_gen_enabled()) {
+		WARN_ON_ONCE(root_reclaim(sc));
 		lru_gen_shrink_lruvec(lruvec, sc);
-	else
+	} else {
 		lru_shrink_lruvec(lruvec, sc);
+	}
 }
 
 void kswapd_clear_hopeless(pg_data_t *pgdat, enum kswapd_clear_hopeless_reason reason)

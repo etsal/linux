@@ -305,7 +305,8 @@ unsigned long reclaim_pages(struct list_head *folio_list)
 
 static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 {
-	if (lru_gen_enabled() && root_reclaim(sc)) {
+	if (lru_gen_enabled()) {
+		WARN_ON_ONCE(!root_reclaim(sc));
 		memset(&sc->nr, 0, sizeof(sc->nr));
 		lru_gen_shrink_node(pgdat, sc);
 	} else {
