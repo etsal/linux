@@ -1178,8 +1178,7 @@ again:
 	nr_reclaimed = sc->nr_reclaimed;
 	nr_scanned = sc->nr_scanned;
 
-	if (!lru_gen_enabled())
-		lru_prepare_scan_control(pgdat, sc);
+	lru_prepare_scan_control(pgdat, sc);
 
 	shrink_node_memcgs(pgdat, sc);
 
