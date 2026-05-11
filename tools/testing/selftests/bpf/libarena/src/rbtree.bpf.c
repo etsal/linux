@@ -50,7 +50,7 @@ int rb_destroy(rbtree_t *rbtree __arg_arena)
 	arena_subprog_init();
 
 	if (rbtree->alloc == RB_NOALLOC) {
-		/* 
+		/*
 		 * We cannot do anything about RB_NOALLOC nodes. The whole
 		 * point of RB_NOALLOC is that the nodes are directly owned
 		 * by the caller that allocates and inserts them. We could
@@ -153,7 +153,7 @@ rbnode_t *rbnode_find(rbnode_t *subtree, u64 key, enum rbnode_find_mode mode)
 		return NULL;
 
 	while (can_loop) {
-		/* 
+		/*
 		 * If we are not looking for the least upper bound,
 		 * we have found the only key. Otherwise keep going
 		 * until we find the "leftmost" instance of the key.
@@ -216,7 +216,7 @@ static inline rbnode_t *rb_node_alloc_common(rbtree_t *rbtree __arg_arena, u64 k
 
 	if (!rbnode)
 		rbnode = malloc(sizeof(*rbnode));
-	
+
 	if (!rbnode)
 		return NULL;
 
@@ -278,7 +278,7 @@ int rb_node_insert(rbtree_t *rbtree __arg_arena, rbnode_t *node __arg_arena)
 
 	mode = RBN_FIND_DFL;
 	/* Always find the first node with the key when allowing duplicates. */
-	if (rbtree->insert == RB_DUPLICATE) 
+	if (rbtree->insert == RB_DUPLICATE)
 		mode = RBN_FIND_LUB;
 	parent = rbnode_find(parent, key, mode);
 
