@@ -83,10 +83,8 @@ typedef struct buddy __arena *buddy_t;
 
 int buddy_init(buddy_t buddy);
 int buddy_destroy(buddy_t buddy);
-int buddy_free_internal(buddy_t buddy, u64 free);
-#define buddy_free(buddy, ptr) buddy_free_internal((buddy), (u64)(ptr))
-u64 buddy_alloc_internal(buddy_t buddy, size_t size);
-#define buddy_alloc(alloc, size) ((void __arena *)buddy_alloc_internal((alloc), (size)))
+int buddy_free(buddy_t buddy, void __arena *ptr);
+void __arena *buddy_alloc(buddy_t buddy, size_t size);
 
 
 #endif /* __BPF__  */

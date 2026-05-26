@@ -750,25 +750,25 @@ static u64 buddy_alloc_from_new_chunk(buddy_t buddy, buddy_chunk_t chunk, int or
 	return (u64)address;
 }
 __weak
-u64 buddy_alloc_internal(buddy_t buddy, size_t size)
+void __arena *buddy_alloc(buddy_t buddy, size_t size)
 {
 	buddy_chunk_t chunk;
-	u64 address = (u64)NULL;
+	u8 __arena *address = NULL;
 	int order;
 
 	if (!buddy)
-		return (u64)NULL;
+		return NULL;
 
 	order = size_to_order(size);
 	if (order >= BUDDY_CHUNK_NUM_ORDERS || order < 0) {
 		arena_stderr("invalid order %d (sz %lu)\n", order, size);
-		return (u64)NULL;
+		return NULL;
 	}
 
 	if (buddy_lock(buddy))
-		return (u64)NULL;
+		return NULL;
 
-	address = buddy_alloc_from_existing_chunks(buddy, order);
+	address = (u8 __arena *)buddy_alloc_from_existing_chunks(buddy, order);
 	buddy_unlock(buddy);
 	if (address)
 		goto done;
@@ -776,12 +776,12 @@ u64 buddy_alloc_internal(buddy_t buddy, size_t size)
 	/* Get a new chunk. */
 	chunk = buddy_chunk_get(buddy);
 	if (chunk)
-		address = buddy_alloc_from_new_chunk(buddy, chunk, order);
+		address = (u8 __arena *)buddy_alloc_from_new_chunk(buddy, chunk, order);
 
 done:
 	/* If we failed to allocate memory, return NULL. */
 	if (!address)
-		return (u64)NULL;
+		return NULL;
 
 	/*
 	 * Unpoison exactly the amount of bytes requested. If the
@@ -789,10 +789,10 @@ done:
 	 * unused bytes that were part of the header.
 	 */
 	if (size < BUDDY_HEADER_OFF + sizeof(struct buddy_header))
-		asan_poison((u8 __arena *)address + BUDDY_HEADER_OFF,
-			    BUDDY_POISONED, sizeof(struct buddy_header));
+		asan_poison(address + BUDDY_HEADER_OFF, BUDDY_POISONED,
+				sizeof(struct buddy_header));
 
-	asan_unpoison((u8 __arena *)address, size);
+	asan_unpoison(address, size);
 
 	return address;
 }
@@ -878,8 +878,9 @@ static __always_inline int buddy_free_unlocked(buddy_t buddy, u64 addr)
 	return 0;
 }
 
-__weak int buddy_free_internal(buddy_t buddy, u64 addr)
+__weak int buddy_free(buddy_t buddy, void __arena *ptr)
 {
+	u64 addr = (u64)ptr;
 	int ret;
 
 	if (!buddy)
