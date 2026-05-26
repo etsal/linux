@@ -7793,7 +7793,7 @@ cand_cache_unlock:
 	return kern_type_id;
 }
 
-enum btf_arg_tag {
+enum btf_arg_or_ret_tag {
 	ARG_TAG_CTX	  = BIT_ULL(0),
 	ARG_TAG_NONNULL   = BIT_ULL(1),
 	ARG_TAG_TRUSTED   = BIT_ULL(2),
@@ -7850,22 +7850,21 @@ static int btf_scan_decl_tags(struct bpf_verifier_env *env,
 	return 0;
 }
 
-static int btf_scan_type_tags(struct bpf_verifier_env *env,
-			      const struct btf *btf, u32 arg_type_id,
-			      u32 arg_idx, u32 *tags)
+static int btf_scan_type_tags(struct bpf_verifier_env *env, const struct btf *btf,
+		u32 type_id, u32 *tags)
 {
 	const struct btf_type *t;
 
-	t = btf_type_by_id(btf, arg_type_id);
+	t = btf_type_by_id(btf, type_id);
 	while (t) {
 		if (btf_type_is_type_tag(t)) {
 			const char *tag = __btf_name_by_offset(btf, t->name_off);
 
-			if (strcmp(tag, "arena") == 0) {
+			if (strcmp(tag, "arena") == 0)
 				*tags |= ARG_TAG_ARENA;
-			} else {
-				bpf_log(&env->log, "arg#%d has unsupported type tag '%s'\n",
-					arg_idx, tag);
+			else {
+				bpf_log(&env->log, "function signature member has unsupported type tag '%s'\n",
+					tag);
 				return -EOPNOTSUPP;
 			}
 		}
@@ -7884,6 +7883,36 @@ static int btf_scan_type_tags(struct bpf_verifier_env *env,
 	}
 
 	return 0;
+}
+
+/* Check whether the type is a valid return type. */
+static int btf_validate_return_type(struct bpf_verifier_env *env, struct btf *btf,
+		const struct btf_type *t, int subprog)
+{
+	u32 tags;
+	int err;
+
+	err = btf_scan_type_tags(env, btf, t->type, &tags);
+	if (err)
+		return err;
+	t = btf_type_by_id(btf, t->type);
+
+	while (btf_type_is_modifier(t))
+		t = btf_type_by_id(btf, t->type);
+
+	/*
+	 * We allow all subprogs except for the main one to return any kind of arena pointer.
+	 * General arena variables are not allowed, since it makes no sense to return by value
+	 * a variable that's on the heap in the first place.
+	 */
+	if (subprog && (tags & ARG_TAG_ARENA) && BTF_INFO_KIND(t->info) == BTF_KIND_PTR)
+		return 0;
+
+	/* We always accept void or scalars. */
+	if (btf_type_is_void(t) || btf_type_is_int(t) || btf_is_any_enum(t))
+		return 0;
+
+	return -EOPNOTSUPP;
 }
 
 /* Process BTF of a function to produce high-level expectation of function
@@ -7969,17 +7998,15 @@ int btf_prepare_func_args(struct bpf_verifier_env *env, int subprog)
 			tname, nargs, MAX_BPF_FUNC_REG_ARGS);
 		return -EINVAL;
 	}
-	/* check that function is void or returns int, exception cb also requires this */
-	t = btf_type_by_id(btf, t->type);
-	while (btf_type_is_modifier(t))
-		t = btf_type_by_id(btf, t->type);
-	if (!btf_type_is_void(t) && !btf_type_is_int(t) && !btf_is_any_enum(t)) {
-		if (!is_global)
-			return -EINVAL;
-		bpf_log(log,
-			"Global function %s() return value not void or scalar. "
-			"Only those are supported.\n",
-			tname);
+
+	err = btf_validate_return_type(env, btf, t, subprog);
+	if (err) {
+		if (is_global) {
+			bpf_log(log,
+				"Global function %s() return value not void or scalar. "
+				"Only those are supported.\n",
+				tname);
+		}
 		return -EINVAL;
 	}
 
@@ -7992,7 +8019,7 @@ int btf_prepare_func_args(struct bpf_verifier_env *env, int subprog)
 		if (err)
 			return err;
 
-		err = btf_scan_type_tags(env, btf, args[i].type, i, &tags);
+		err = btf_scan_type_tags(env, btf, args[i].type, &tags);
 		if (err)
 			return err;
 
