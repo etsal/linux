@@ -1,0 +1,86 @@
+Subject: [PATCH v2 0/5] bpf: Minimize annotations for arena programs
+From: Emil Tsalapatis <emil@etsalapatis.com>
+Date: Fri, 29 May 2026 20:22:54 -0400
+Message-Id: <20260530002259.4505-1-emil@etsalapatis.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+
+BPF programs must currently include code to address two limitations
+of function signatures that include arena types. First, arena arguments
+must be annotated with __arg_arena in the function signature in addition
+to __arena. Second, it is currently not allowed to return an arena pointer
+from a subprog, even though it is safe to do so. These limitations require
+extra annotations and typecasts respectively, and have proven sources of
+confusion to programmers.
+
+The patchset improves arena-related function signatures in two ways.
+First, it removes the need for __arg_arena in function signatures.
+Second, it allows subprogs to directly return arena pointers to their
+caller.
+
+To do this we add a new type tag to the existing __arena annotation.
+The annotation is currently an alias for __attribute__((address_space(1))),
+which is not discoverable from BTF alone and so cannot be used to
+determine whether a pointer variable is an arena pointer during
+verification. With the new type tag, we can determine whether
+either the arguments and or the return value of a function belong
+in an arena.
+
+We test the new code by modifying libarena to take advantage of these
+relaxed limitations.
+
+CHANGELOG
+=========
+
+v2 -> v3 (https://lore.kernel.org/bpf/20260530002259.4505-1-emil@etsalapatis.com/)
+
+- Added Acks by Eduard
+- Complete the __arg_arena removal by removing them from htab (Alexei)
+- Add a test in verifier_arena_globals1.c to confirm the new __arena attribute
+works as expected in function argument and return types
+- Reject type tags on non-pointer types, currently only possible in handcrafted
+  BTF (Eduard)
+- Undo inaccurate change on verifier comment (AI)
+[TODO] - Fix error return values in a couple places (Eduard)
+[TODO] - Review error handling for non-global functions returning invalid
+type kind (Eduard)
+
+v1 -> v2 (lore.kernel.org/bpf/20260527071457.4598-1-emil@etsalapatis.com/)
+
+- Rebased to fix conflict
+- Removed the typedef foo * foo_t typedefs. Those were necessary to avoid
+annotating each instance of the type with __arena. The new version of the
+patch instead removes typedefs and uses __arena everywhere directly (see
+patch 4/5 for more details).
+- Reorganized the patchset to frontload all kernel-side changes and place
+the libarena changes at the end.
+
+
+Emil Tsalapatis (5):
+  selftests/bpf: libarena: Add "arena" BTF type tag to __arena qualifier
+  verifier: parse BTF type tags for function arguments
+  bpf: Allow subprogs to return arena pointers
+  selftests/bpf: Remove __arg_arena from the codebase
+  selftests/bpf: libarena: Directly return arena pointers from functions
+
+ kernel/bpf/btf.c                              | 170 +++++++++++++-----
+ kernel/bpf/verifier.c                         |   6 +-
+ tools/testing/selftests/bpf/bpf_arena_htab.h  |  11 +-
+ .../selftests/bpf/bpf_arena_strsearch.h       |   4 +-
+ .../bpf/libarena/include/bpf_arena_common.h   |   4 +-
+ .../libarena/include/bpf_arena_spin_lock.h    |   6 +-
+ .../bpf/libarena/include/libarena/asan.h      |   6 +-
+ .../bpf/libarena/include/libarena/buddy.h     |  23 +--
+ .../bpf/libarena/include/libarena/common.h    |   3 +-
+ .../libarena/selftests/st_asan_buddy.bpf.c    |   4 +-
+ .../bpf/libarena/selftests/st_asan_common.h   |   2 +-
+ .../bpf/libarena/selftests/st_buddy.bpf.c     |   2 +-
+ .../selftests/bpf/libarena/src/asan.bpf.c     |  38 ++--
+ .../selftests/bpf/libarena/src/buddy.bpf.c    |  96 +++++-----
+ .../selftests/bpf/libarena/src/common.bpf.c   |  10 +-
+ .../selftests/bpf/progs/arena_spin_lock.c     |   1 +
+ 16 files changed, 225 insertions(+), 161 deletions(-)
+
+-- 
+2.54.0
