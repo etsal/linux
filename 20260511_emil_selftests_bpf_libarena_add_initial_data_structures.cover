@@ -1,0 +1,76 @@
+Subject: [PATCH 0/2] selftests/bpf: libarena: Add initial data structures
+From: Emil Tsalapatis <emil@etsalapatis.com>
+Date: Mon, 11 May 2026 17:40:58 -0400
+Message-Id: <20260511214100.9487-1-emil@etsalapatis.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+
+Add two new data structures to libarena. These data structures initially
+resided in the sched-ext repo (https://github.com/sched-ext/scx) and
+have been adapted to the internal libarena build system. The data
+structures are:
+
+- Red black tree: Fundamental tree data structure that can also serve
+  as a base for more domain-specific data structures.
+
+- Lev-Chase deque: Queue data structure that allows efficient work
+  stealing, useful in scheduling scenarios.
+
+The data structures are accompanied by selftests that are automatically
+discovered by the existing libarena test_progs selftest and incorporated
+in the CI.
+
+CHANGELOG
+=========
+
+v3 -> v4 (https://lore.kernel.org/bpf/20260604235016.20856-1-emil@etsalapatis.com/)
+- Turn off load_acquire/store_relesase - dependent selftests for s390 (CI)
+- Various style/non-functional nits (AI)
+
+v2 -> v3 (https://lore.kernel.org/bpf/20260603182727.3922-1-emil@etsalapatis.com/)
+
+- Add workaround to handle LLVM 21 and GCC 15 assignment-to-memset promotions
+  that are causing verification failures for arena programs (CI)
+- Incorporate Sashiko feedback for cleanup edge cases (Sashiko)
+- Simplify some of the ordering semantics in spmc
+
+v1 -> v2 (https://lore.kernel.org/bpf/20260511214100.9487-1-emil@etsalapatis.com/):
+
+- Rename tests from st_ to test_ (Alexei)
+- Removed the freelist caches from the rbtrees, previously used to defer freeing (Alexei)
+- Moved the type and function definitions to use the __arena identifier
+- Removed the typecasts during function return and directly return __arena
+  pointers (Alexei)
+- Renamed queues to spmc queues to abstract away the algorithm (Alexei)
+- Adjusted the memory barriers in the spmc queue
+- Added multithreaded testing harness for libarena programs (Alexei)
+- Added parallel selftest for queues (Alexei)
+- Split least upper bound and exact find operations back into separate
+  functions to prevent RB_DUPLICATE-related bug (AI)
+
+Emil Tsalapatis (2):
+  selftests/bpf: libarena: Add rbtree data structure
+  selftests/bpf: libarena: Add Lev-Chase queue data structure
+
+ .../bpf/libarena/include/libarena/lvqueue.h   |   33 +
+ .../bpf/libarena/include/libarena/rbtree.h    |   89 ++
+ .../bpf/libarena/selftests/st_lvqueue.bpf.c   |  194 ++++
+ .../bpf/libarena/selftests/st_rbtree.bpf.c    |  974 ++++++++++++++++
+ .../selftests/bpf/libarena/src/lvqueue.bpf.c  |  241 ++++
+ .../selftests/bpf/libarena/src/rbtree.bpf.c   | 1032 +++++++++++++++++
+ 6 files changed, 2563 insertions(+)
+ create mode 100644 tools/testing/selftests/bpf/libarena/include/libarena/lvqueue.h
+ create mode 100644 tools/testing/selftests/bpf/libarena/include/libarena/rbtree.h
+ create mode 100644 tools/testing/selftests/bpf/libarena/selftests/st_lvqueue.bpf.c
+ create mode 100644 tools/testing/selftests/bpf/libarena/selftests/st_rbtree.bpf.c
+ create mode 100644 tools/testing/selftests/bpf/libarena/src/lvqueue.bpf.c
+ create mode 100644 tools/testing/selftests/bpf/libarena/src/rbtree.bpf.c
+
+---
+
+Resending this because I typo'ed Matt's email _again_, sorry about
+that.
+
+-- 
+2.54.0
