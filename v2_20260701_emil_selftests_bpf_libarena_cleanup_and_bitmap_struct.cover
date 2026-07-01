@@ -1,0 +1,65 @@
+Subject: [PATCH v2 0/5] selftests/bpf: libarena cleanup and bitmap struct
+From: Emil Tsalapatis <emil@etsalapatis.com>
+Date: Wed, 01 Jul 2026 14:52:30 -0400
+Message-Id: <20260701185235.4516-1-emil@etsalapatis.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+
+Cleanup patches for libarena, along with a new bitmap data type that is
+in use by sched-ext. Patch 1 is an NFC that properly renames the buddy
+selftests for consistency. Patch 2 fixes the zero variable used in
+libarena for can_loop based looping, and afterwrds removes all bpf_for()
+instances from the code. Patch 3 fixes an (untriggered) edge case that 
+could cause spurious selftest failures. Finally, patches 4 and 5
+introduce the bitmap data structure along with selftests.
+
+Signed-off-by: Emil Tsalapatis <emil@etsalapatis.com>
+
+
+CHANGELOG
+=========
+
+v2 -> v3: (https://lore.kernel.org/bpf/20260701185235.4516-1-emil@etsalapatis.com)
+- Remove unused macros and fix typo in commit message (AI)
+
+v1 -> v2: (https://lore.kernel.org/bpf/20260618085626.19633-1-emil@etsalapatis.com)
+
+- Added acks by Ihor and Eduard
+- Fix missing commit message (Ihor)
+- Enforce 64 bits per cell with BITS_TO_LONG_LONG (Sashiko)
+- Add test for bmp_copy (Ihor)
+- Add atomic versions of _set() and _clear() (Ihor) and add a parallel
+  selftest for them.
+
+
+Emil Tsalapatis (5):
+  selftests/bpf: libarena: Fix can-loop zero variable definition
+  selftests/bpf: libarena: Clean up allocation state before buddy tests
+  selftests/bpf: Add arena-based bitmap data structure
+  selftests/bpf: libarena: Add bitmap selftets
+  selftests/bpf: libarena: Add parallel bitmap selftest
+
+ .../bpf/libarena/include/libarena/bitmap.h    |  34 ++
+ .../bpf/libarena/include/libarena/common.h    |   2 +-
+ .../libarena/selftests/test_asan_buddy.bpf.c  |   8 +-
+ .../bpf/libarena/selftests/test_bitmap.bpf.c  | 394 ++++++++++++++++++
+ .../bpf/libarena/selftests/test_buddy.bpf.c   |   8 +-
+ .../selftests/test_parallel_bitmap.bpf.c      | 191 +++++++++
+ .../selftests/test_parallel_spmc.bpf.c        |   9 +-
+ .../selftests/bpf/libarena/src/bitmap.bpf.c   | 245 +++++++++++
+ .../selftests/bpf/libarena/src/common.bpf.c   |   9 +-
+ .../selftests/bpf/prog_tests/libarena.c       |   8 +-
+ .../selftests/bpf/prog_tests/libarena_asan.c  |   8 +-
+ 11 files changed, 900 insertions(+), 16 deletions(-)
+ create mode 100644 tools/testing/selftests/bpf/libarena/include/libarena/bitmap.h
+ create mode 100644 tools/testing/selftests/bpf/libarena/selftests/test_bitmap.bpf.c
+ create mode 100644 tools/testing/selftests/bpf/libarena/selftests/test_parallel_bitmap.bpf.c
+ create mode 100644 tools/testing/selftests/bpf/libarena/src/bitmap.bpf.c
+
+-- 
+2.54.0
+
+
+
+
