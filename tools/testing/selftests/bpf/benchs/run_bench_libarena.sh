@@ -20,10 +20,11 @@ summarize_libarena()
 
 header "libarena sequential malloc\n"
 
-for size in 16 64 256 1024 4096; do
+#for size in 16 64 256 1024 4096; do
+for size in 16 1024 4096; do
 subtitle "allocation size: $size"
 printf "\t-------------------\n"
-	for nallocs in 10 50 100 500 1000 5000 10000; do
+	for nallocs in 1000 10000; do
 		summarize_libarena "malloc:" \
 			"$($RUN_BENCH --alloc_size "$size" --nallocs "$nallocs" libarena-malloc)"
 		summarize_libarena "calloc:" \
