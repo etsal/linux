@@ -49,6 +49,7 @@ extern volatile u64 asan_violated;
 int arena_fls(__u64 word);
 
 void __arena *arena_malloc(size_t size);
+void __arena *arena_calloc(size_t ncount, size_t size);
 void arena_free(void __arena *ptr);
 
 /*
