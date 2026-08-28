@@ -73,3 +73,9 @@ struct bmag_pool {
 #define BMAG_POOL_MAG(pool, order, ind)	((pool)->percpu[bpf_get_smp_processor_id()].bmags[(order)][(ind)])
 #define BMAG_POOL_CUR(pool, order)	BMAG_POOL_MAG((pool), (order), 0)
 #define BMAG_POOL_PREV(pool, order)	BMAG_POOL_MAG((pool), (order), 1)
+
+/* Helpers for NMI reentrancy. */
+
+struct __attribute__((aligned(64))) bmag_active {
+	unsigned int value;
+};

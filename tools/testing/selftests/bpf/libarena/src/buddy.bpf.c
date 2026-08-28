@@ -45,6 +45,7 @@ static u64 arena_next_pow2(__u64 n);
 static void __arena *buddy_alloc_memory(struct buddy __arena *buddy, size_t size,
 					size_t norder, bool *bmag_refill_needed);
 static int buddy_free_unlocked(struct buddy __arena *buddy, u64 addr);
+static struct bmag_active active[BMAG_MAX_CPUS];
 
 /*
  * We do not currently support bmags with ASAN because it is not possible to fit even
@@ -58,6 +59,20 @@ static int buddy_free_unlocked(struct buddy __arena *buddy, u64 addr);
 #else 
 #define DISABLE_BMAG_IF_ASAN(...)
 #endif
+
+/*
+ * The only concurrency we have is through NMI preemption, so 
+ * we do not require any kind of barrier.
+ */
+static inline unsigned int bmag_get_active(void)
+{
+	return READ_ONCE(active[bpf_get_smp_processor_id()].value);
+}
+
+static inline unsigned int bmag_set_active(unsigned int val)
+{
+	return WRITE_ONCE(active[bpf_get_smp_processor_id()].value, val);
+}
 
 void bmag_push_mag(struct bmag __arena * __arena *list, struct bmag __arena *bmag)
 {
@@ -131,15 +146,29 @@ void __arena *buddy_bmag_alloc(struct buddy __arena *buddy, size_t order)
 	struct bmag_pool __arena *pool = buddy->bmag_pool;
 	struct bmag __arena *full, *empty;
 	void __arena *address = NULL;
+	unsigned int active;
 
 	DISABLE_BMAG_IF_ASAN(NULL);
 
 	if (order > BMAG_NUM_ORDERS)
 		return NULL;
 
+	/* 
+	 * No support for allocations from NMIs that preempted an in-flight
+	 * allocation, just like the kernel's BPF memory allocator.
+	 *
+	 * No need for get/set active atomicity. Our own active context never
+	 * changes since a context's active count can only be modified while
+	 * in that context.
+	 */
+	active = bmag_get_active();
+	if (active > 0)
+		return NULL;
+	bmag_set_active(active + 1);
+
 	address = bmag_pool_alloc(pool, order);
 	if (address)
-		return address;
+		goto done;
 
 	/* 
 	 * Get a full mag from the pool and place the 
@@ -147,7 +176,7 @@ void __arena *buddy_bmag_alloc(struct buddy __arena *buddy, size_t order)
 	 */
 	full = bmag_get_mag(&pool->full[order]);
 	if (!full)
-		return NULL;
+		goto done;
 
 	empty = BMAG_POOL_PREV(pool, order);
 	BMAG_POOL_PREV(pool, order) = BMAG_POOL_CUR(pool, order);
@@ -156,6 +185,9 @@ void __arena *buddy_bmag_alloc(struct buddy __arena *buddy, size_t order)
 	bmag_push_mag(&pool->empty, empty);
 
 	address = bmag_pool_alloc(pool, order);
+
+done:
+	bmag_set_active(active);
 
 	return address;
 }
@@ -176,6 +208,7 @@ int buddy_bmag_free(struct buddy __arena *buddy, void __arena *addr)
 {
 	struct bmag_pool __arena *pool = buddy->bmag_pool;
 	struct bmag __arena *full, *empty;
+	unsigned int active;
 	int order;
 	int ret = 0;
 
@@ -184,6 +217,11 @@ int buddy_bmag_free(struct buddy __arena *buddy, void __arena *addr)
 	order = buddy_bmag_get_order(addr);
 	if (order > BMAG_NUM_ORDERS)
 		return -EINVAL;
+
+	active = bmag_get_active();
+	if (active > 0)
+		return -EAGAIN;
+	bmag_set_active(active + 1);
 
 	ret = bmag_pool_free(pool, order, addr);
 	if (!ret)
@@ -203,7 +241,7 @@ int buddy_bmag_free(struct buddy __arena *buddy, void __arena *addr)
 		 * as we refill the pool during allocations.
 		 */
 		ret = -EINVAL;
-		return ret;
+		goto done;
 	}
 
 	full = BMAG_POOL_PREV(pool, order);
@@ -214,6 +252,9 @@ int buddy_bmag_free(struct buddy __arena *buddy, void __arena *addr)
 
 	/* Free into the new mag. */
 	bmag_pool_free(pool, order, addr);
+
+done:
+	bmag_set_active(active);
 
 	return ret;
 }
@@ -1057,6 +1098,9 @@ static void __arena *buddy_alloc_memory(struct buddy __arena *buddy, size_t size
 			goto done;
 	}
 
+	if (bpf_in_nmi())
+		return NULL;
+
 	if (buddy_lock(buddy, flags))
 		return NULL;
 
@@ -1226,6 +1270,95 @@ static int buddy_free_unlocked(struct buddy __arena *buddy, u64 addr)
 	return 0;
 }
 
+static bool buddy_deferred_free_pending(struct buddy __arena *buddy)
+{
+	return buddy->deferred_free != NULL;
+}
+
+static void buddy_deferred_free_start(struct buddy __arena *buddy, void __arena *addr)
+{
+	void __arena *head;
+	void __arena * __arena *new;
+
+	/* 
+	 * Make a linked list by chaining the allocations into a linked list.
+	 * Possible because allocations are 16 bytes minimum and so fit a pointer.
+	 */
+	new = (void __arena * __arena *)addr;
+	do  {
+		head = buddy->deferred_free;
+		*new = head;
+	} while (cmpxchg((void __arena * __arena *)&buddy->deferred_free,
+			 head, (void __arena *)new) != head && can_loop);
+}
+
+static void buddy_deferred_free_start_bulk(struct buddy __arena *buddy,
+		 void __arena * __arena *addrs, size_t naddrs)
+{
+	void __arena *head, *first, *last, *addr;
+	unsigned int i;
+
+	/* Create a linked list locally. */
+	first = NULL;
+	last = NULL;
+	for (i = zero; i < naddrs && can_loop; i++) {
+		addr = addrs[i];
+		if (!addr)
+			continue;
+
+		if (!first)
+			first = addr;
+		else
+			*(void __arena * __arena *)last = addr;
+
+		last = addr;
+	}
+
+	if (!first)
+		return;
+
+	/* 
+	 * Make a linked list by chaining the allocations into a linked list.
+	 * Possible because allocations are 16 bytes minimum and so fit a pointer.
+	 */
+	do  {
+		head = buddy->deferred_free;
+		*(void __arena * __arena *)last = head;
+	} while (cmpxchg((void __arena * __arena *)&buddy->deferred_free,
+			 head, first) != head && can_loop);
+}
+
+static int buddy_deferred_free_complete(struct buddy __arena *buddy)
+{
+	void __arena *head, *old;
+	int ret = 0, err;
+
+	do {
+		head = buddy->deferred_free;
+		if (!head)
+			break;
+		old = head;
+
+		/* 
+		 * The cmpxchg is safe because we never pop from the list 
+		 * without holding the buddy lock. The next pointer of
+		 * the element then cannot have been gotten invalidated.
+		 */
+
+	} while (cmpxchg((void __arena * __arena *)&buddy->deferred_free,
+			 old, NULL) != old && can_loop);
+
+	while (head && can_loop) {
+		old = head;
+		head = *(void __arena * __arena *)head;
+
+		err = buddy_free_unlocked(buddy, (u64)old);
+		ret = ret ?: err;
+	}
+
+	return ret;
+}
+
 __weak int buddy_free(struct buddy __arena *buddy, void __arena *addr)
 {
 	unsigned long flags;
@@ -1243,16 +1376,29 @@ __weak int buddy_free(struct buddy __arena *buddy, void __arena *addr)
 	if (!ret)
 		return 0;
 
+	if (bpf_in_nmi()) {
+		buddy_deferred_free_start(buddy, addr);
+		return 0;
+	}
+
 	ret = buddy_lock(buddy, flags);
 	if (ret)
 		return ret;
 
 	ret = buddy_free_unlocked(buddy, (u64)addr);
 
+	/* Drain any frees stranded during an NMI. */
+	if (unlikely(buddy_deferred_free_pending(buddy))) {
+		ret = buddy_deferred_free_complete(buddy);
+		if (ret)
+			goto out_unlock;
+	}
+
 	/* If necessary, shrink the allocator. */
 	order = buddy_bmag_get_order(addr);
 	buddy_bmag_shrink(buddy, order);
 
+out_unlock:
 	buddy_unlock(buddy, flags);
 
 	return ret;
@@ -1274,6 +1420,11 @@ __weak int buddy_free_bulk(struct buddy __arena *buddy, void __arena * __arena *
 	if (!addrs)
 		return -EINVAL;
 
+	if (bpf_in_nmi()) {
+		buddy_deferred_free_start_bulk(buddy, addrs, naddrs);
+		return 0;
+	}
+
 	ret = buddy_lock(buddy, flags);
 	if (ret)
 		return ret;
@@ -1284,6 +1435,12 @@ __weak int buddy_free_bulk(struct buddy __arena *buddy, void __arena * __arena *
 			continue;
 
 		err = buddy_free_unlocked(buddy, (u64)addrs[i]);
+		ret = ret ?: err;
+	}
+
+	/* Drain any frees stranded during an NMI. */
+	if (unlikely(buddy_deferred_free_pending(buddy))) {
+		err = buddy_deferred_free_complete(buddy);
 		ret = ret ?: err;
 	}
 

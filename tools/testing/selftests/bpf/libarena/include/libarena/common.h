@@ -6,6 +6,8 @@
 
 #include <vmlinux.h>
 
+#include <bpf/bpf_core_read.h>
+
 #include <bpf_arena_common.h>
 #include <bpf_arena_spin_lock.h>
 
@@ -61,6 +63,62 @@ void arena_free(void __arena *ptr);
  * access the arena and help the verifier.
  */
 #define arena_subprog_init() do { asm volatile ("" :: "r"(&arena)); } while (0)
+
+#define PREEMPT_BITS	8
+#define SOFTIRQ_BITS	8
+#define HARDIRQ_BITS	4
+#define NMI_BITS	4
+
+#define PREEMPT_SHIFT	0
+#define SOFTIRQ_SHIFT	(PREEMPT_SHIFT + PREEMPT_BITS)
+#define HARDIRQ_SHIFT	(SOFTIRQ_SHIFT + SOFTIRQ_BITS)
+#define NMI_SHIFT	(HARDIRQ_SHIFT + HARDIRQ_BITS)
+
+#define __IRQ_MASK(x)	((1UL << (x)) - 1)
+
+#define NMI_MASK	(__IRQ_MASK(NMI_BITS) << NMI_SHIFT)
+
+#ifdef bpf_target_x86
+extern const int __preempt_count __ksym __weak;
+
+struct pcpu_hot___local {
+	int preempt_count;
+} __attribute__((preserve_access_index));
+
+extern struct pcpu_hot___local pcpu_hot __ksym __weak;
+#endif
+
+#ifdef bpf_target_s390
+extern struct lowcore *bpf_get_lowcore(void) __weak __ksym;
+#endif
+
+static inline int get_preempt_count(void)
+{
+#if defined(bpf_target_x86)
+	if (bpf_ksym_exists(&__preempt_count))
+		return *(int *)bpf_this_cpu_ptr(&__preempt_count);
+
+	if (bpf_core_field_exists(pcpu_hot.preempt_count))
+		return ((struct pcpu_hot___local *)
+			bpf_this_cpu_ptr(&pcpu_hot))->preempt_count;
+#elif defined(bpf_target_arm64)
+	return bpf_get_current_task_btf()->thread_info.preempt.count;
+#elif defined(bpf_target_powerpc)
+	return bpf_get_current_task_btf()->thread_info.preempt_count;
+#elif defined(bpf_target_s390)
+	return bpf_get_lowcore()->preempt_count;
+#elif defined(bpf_target_loongarch)
+	return bpf_get_current_task_btf()->thread_info.preempt_count;
+#elif defined(bpf_target_riscv)
+	return bpf_get_current_task_btf()->thread_info.preempt_count;
+#endif
+	return 0;
+}
+
+static inline int bpf_in_nmi(void)
+{
+	return get_preempt_count() & NMI_MASK;
+}
 
 /*
  * BPF does not currently support the memset intrinsics. for large
