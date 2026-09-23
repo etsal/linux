@@ -1,0 +1,59 @@
+From a1a7d2630a0cd277790565acd2544a465ee8fe73 Mon Sep 17 00:00:00 2001
+From: Emil Tsalapatis <emil@etsalapatis.com>
+Date: Wed, 23 Sep 2026 12:03:58 -0700
+Subject: [PATCH bpf-next v3 0/6] bpf: Fix arena memory incoherence
+
+Setting up arena memory for a task currently requires two operations:
+Adjusting its range tree, used for tracking which memory is allocated;
+and adjusting its page tables/flushing its TLB state. These operations
+cannot happen atomically because their critical sections do not nest.
+This lack of atomicity is the source of two bugs that can lead to
+incoherence between different users of the same arena, wherein they
+observe different pages for the same address.
+
+Address the problem by more finely tracking the state of each address.
+Expand the range tree used for address state tracking with a third
+state, used to denote whether an address range is unavailable, either
+because it is being freed or because it is being populated by a VM
+fault. Use this extra state in the arena page freeing/fault logic
+to ensure that operations on a single address properly serialize.
+
+Signed-off-by: Emil Tsalapatis <emil@etsalapatis.com>
+Cc: Puranjay Mohan <puranjay@kernel.org>
+
+v2 -> v3 (https://lore.kernel.org/bpf/20260923061425.7045-1-emil@etsalapatis.com/)
+
+- Rebase on bpf-next and resolve conflicts
+- Fold in the atomic mark_available range tree operation into initial
+  fix patches
+
+v1 -> v2 (https://lore.kernel.org/bpf/20260902070239.16968-1-emil@etsalapatis.com/)
+
+- Use __range_iter_next() in is_range_tree_set() (bot-ci)
+- Move -EAGAIN handling to the patch where the errno is introduced (bot-ci)
+- Add refactoring patch for (Puranjay)
+- Avoid leaking unavailable range tree nodes with atomic mark_available
+  operation()
+- Avoid retries on res spinlock locking for -EDEADLK (Puranjay)
+
+
+Emil Tsalapatis (6):
+  bpf: Update is_range_tree_set to work for consecutive ranges
+  bpf: Track availability information for ranges in range tree
+  bpf: Fix arena race between page free and alloc leading to incoherency
+  bpf: Add explicit state machine for arena free spans
+  bpf: Atomically update PTE and range tree in arena VM fault handler
+  selftests/bpf: Add arena allocation race tests
+
+ kernel/bpf/arena.c                            | 240 ++++++++++++++--
+ kernel/bpf/range_tree.c                       | 237 ++++++++++++---
+ kernel/bpf/range_tree.h                       |   8 +-
+ .../selftests/bpf/prog_tests/arena_race.c     | 270 ++++++++++++++++++
+ .../testing/selftests/bpf/progs/arena_race.c  | 159 +++++++++++
+ 5 files changed, 851 insertions(+), 63 deletions(-)
+ create mode 100644 tools/testing/selftests/bpf/prog_tests/arena_race.c
+ create mode 100644 tools/testing/selftests/bpf/progs/arena_race.c
+
+-- 
+2.52.0
+

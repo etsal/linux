@@ -1,0 +1,64 @@
+From 38eff6abfa38f73e20da45469d5dcef57f2bdd07 Mon Sep 17 00:00:00 2001
+From: Emil Tsalapatis <emil@etsalapatis.com>
+Date: Wed, 2 Sep 2026 03:02:35 -0400
+Subject: [PATCH bpf-next v3 1/6] bpf: Update is_range_tree_set to work for
+ consecutive ranges
+
+The arena range tree currently does not handle consecutive
+ranges present in the tree. This is by design: Consecutive
+ranges get merged into one by default. However, this design
+only lets us track a single bit's worth of state for each
+address range, encoded by whether the range is present in
+the tree or not (i.e., is it allocated).
+
+We require more fine-grained state tracking for each range.
+This means possibly having in the tree consecutive ranges
+that cannot be merged because they have different states.
+However, existing code implicitly assumes that this scenario
+is not possible in its logic.
+
+Expand the logic of is_range_tree_set to handle consecutive
+ranges in the tree. The logic change does not affect existing
+users and amounts to a defensive check until we enable unmergeable
+consecutive ranges in subsequent patches.
+
+Signed-off-by: Emil Tsalapatis <emil@etsalapatis.com>
+---
+ kernel/bpf/range_tree.c | 20 +++++++++++++++-----
+ 1 file changed, 15 insertions(+), 5 deletions(-)
+
+diff --git a/kernel/bpf/range_tree.c b/kernel/bpf/range_tree.c
+index 2f28886f3ff7..fdf7ba7aefe0 100644
+--- a/kernel/bpf/range_tree.c
++++ b/kernel/bpf/range_tree.c
+@@ -180,12 +180,22 @@ int range_tree_clear(struct range_tree *rt, u32 start, u32 len)
+ int is_range_tree_set(struct range_tree *rt, u32 start, u32 len)
+ {
+ 	u32 last = start + len - 1;
+-	struct range_node *left;
++	struct range_node *rn;
+ 
+-	/* Is this whole range set ? */
+-	left = range_it_iter_first(rt, start, last);
+-	if (left && left->rn_start <= start && left->rn_last >= last)
+-		return 0;
++	for ((rn = range_it_iter_first(rt, start, last)); rn != NULL;
++		rn = __range_it_iter_next(rn, start, last)) {
++		/* Make sure the range covers the start */
++		if (rn->rn_start > start)
++			return -ESRCH;
++
++		/* If it covers the entire range we're done. */
++		if (rn->rn_last >= last)
++			return 0;
++
++		start = rn->rn_last + 1;
++	}
++
++	/* No range to cover [start, last] */
+ 	return -ESRCH;
+ }
+ 
+-- 
+2.52.0
+

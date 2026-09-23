@@ -1,0 +1,204 @@
+From 14d565417d08f7d8edae0a5894cfc31006500c63 Mon Sep 17 00:00:00 2001
+From: Emil Tsalapatis <emil@etsalapatis.com>
+Date: Wed, 2 Sep 2026 03:02:38 -0400
+Subject: [PATCH bpf-next v3 5/6] bpf: Atomically update PTE and range tree in
+ arena VM fault handler
+
+The arena allocation code currently has a race in the fault handler
+that can cause userspace threads to write to the wrong arena page.
+
+a) The fault handler removes a range from the range tree to mark the
+addresses as allocated, then installs a page A into the kernel page
+tables.
+
+b) A concurrent free/reallocation removes A and installs a page B.
+
+c) The fault handler still goes ahead with installing page A in the
+page table. The kernel sees page B, while userspace sees page A.
+
+There is no way to protect the PTE installation and the range tree
+modification simultaneously, because we cannot nest the synchronization
+primitives for their respective critical sections. PTE allocation
+may require allocations due to PTE reclamation, and its spinlock
+becomes sleepable under PREEMPT_RT. Thus we cannot do this operation
+while holding the range tree spinlock. There is no public API for
+manually taking this spinlock, so we nest the range tree operation
+inside it.
+
+Solve this issue by adjusting the range tree in two steps. First,
+mark the address of the page being allocated as unavailable. Then
+drop the range spinlock, insert the PTE, take the range spinlock
+again, and fully remove it from the range tree. Concurrent free
+operations get serialized to before the fault handler, while
+it is not possible to allocate the page once it has been reserved.
+Concurrent page fault handler calls retry until the page is fully
+allocated by the original call.
+
+Also return VM_FAULT_RETRY for transient allocation failures. These
+are a) faulting on pages that are temporarily marked unavailable in
+the range tree and b) rqspinlock acquisition failures.
+
+Fixes: 317460317a02 ("bpf: Introduce bpf_arena.")
+Signed-off-by: Emil Tsalapatis <emil@etsalapatis.com>
+---
+ kernel/bpf/arena.c      | 66 ++++++++++++++++++++++++++++++-----------
+ kernel/bpf/range_tree.c | 14 +++++++++
+ kernel/bpf/range_tree.h |  1 +
+ 3 files changed, 64 insertions(+), 17 deletions(-)
+
+diff --git a/kernel/bpf/arena.c b/kernel/bpf/arena.c
+index 69c8924f4c30..5438b68d269a 100644
+--- a/kernel/bpf/arena.c
++++ b/kernel/bpf/arena.c
+@@ -489,8 +489,9 @@ static vm_fault_t arena_vm_fault(struct vm_fault *vmf)
+ 	struct bpf_map *map = vmf->vma->vm_file->private_data;
+ 	struct bpf_arena *arena = container_of(map, struct bpf_arena, map);
+ 	struct mem_cgroup *new_memcg, *old_memcg;
+-	struct page *page, *new_page = NULL;
+ 	vm_fault_t fault_ret;
++	struct range_node *unavail_node;
++	struct page *page, *new_page = NULL;
+ 	long kbase, kaddr;
+ 	unsigned long flags;
+ 	int ret;
+@@ -512,15 +513,17 @@ static vm_fault_t arena_vm_fault(struct vm_fault *vmf)
+ 		bpf_map_memcg_exit(old_memcg, new_memcg);
+ 	}
+ 
+-	if (raw_res_spin_lock_irqsave(&arena->spinlock, flags)) {
+-		/*
+-		 * A failed lock means a possible deadlock was detected. Don't
+-		 * return VM_FAULT_RETRY: this handler never took mmap_lock, but
+-		 * the fault path would re-take it on retry and deadlock. Fail.
+-		 */
+-		if (new_page)
+-			free_pages_nolock(new_page, 0);
+-		return VM_FAULT_SIGBUS;
++	ret = raw_res_spin_lock_irqsave(&arena->spinlock, flags);
++	if (ret) {
++		/* If we are deadlocking somehow, no way to ensure forward progress. */
++		if (ret == -EDEADLK) {
++			if (new_page)
++				free_pages_nolock(new_page, 0);
++			return VM_FAULT_SIGBUS;
++		}
++
++		if (ret)
++			goto retry;
+ 	}
+ 
+ 	page = vmalloc_to_page((void *)kaddr);
+@@ -562,7 +565,7 @@ static vm_fault_t arena_vm_fault(struct vm_fault *vmf)
+ 	/* If a range is unavailable, try again. */
+ 	if (ret == -EAGAIN) {
+ 		raw_res_spin_unlock_irqrestore(&arena->spinlock, flags);
+-		goto retry;
++		goto retry_memcg;
+ 	} else if (ret) {
+ 		fault_ret = VM_FAULT_SIGBUS;
+ 		goto out_err_locked_memcg;
+@@ -583,12 +586,40 @@ static vm_fault_t arena_vm_fault(struct vm_fault *vmf)
+ 	page = new_page;
+ 	new_page = NULL;
+ out:
+-	page_ref_add(page, 1);
++	/* Reserve the page while installing its user PTE without the arena lock. */
++	bpf_map_memcg_enter(&arena->map, &old_memcg, &new_memcg);
++	unavail_node = range_tree_set_unavail(&arena->rt, vmf->pgoff, 1);
++	bpf_map_memcg_exit(old_memcg, new_memcg);
+ 	raw_res_spin_unlock_irqrestore(&arena->spinlock, flags);
+-	if (new_page)
++
++	if (new_page) {
+ 		free_pages_nolock(new_page, 0);
+-	vmf->page = page;
+-	return 0;
++		new_page = NULL;
++	}
++
++	/* If we couldn't mark the page unavailable, retry. */
++	if (IS_ERR(unavail_node)) {
++		ret = PTR_ERR(unavail_node);
++		if (ret == -EAGAIN)
++			goto retry;
++		return VM_FAULT_SIGBUS;
++	}
++
++	fault_ret = vmf_insert_page(vmf->vma, vmf->address, page);
++	while ((ret = raw_res_spin_lock_irqsave(&arena->spinlock, flags))) {
++		/* If we somehow deadlocked stop trying to take the lock. */
++		if (ret == -EDEADLK) {
++			range_node_mark_available(unavail_node);
++			return VM_FAULT_SIGBUS;
++		}
++
++		cond_resched();
++	}
++
++	ret = range_tree_remove_unavail(&arena->rt, vmf->pgoff, 1);
++	raw_res_spin_unlock_irqrestore(&arena->spinlock, flags);
++	WARN_ON_ONCE(ret);
++	return fault_ret;
+ 
+ out_err_locked_memcg:
+ 	bpf_map_memcg_exit(old_memcg, new_memcg);
+@@ -598,8 +629,9 @@ static vm_fault_t arena_vm_fault(struct vm_fault *vmf)
+ 		free_pages_nolock(new_page, 0);
+ 	return fault_ret;
+ 
+-retry:
++retry_memcg:
+ 	bpf_map_memcg_exit(old_memcg, new_memcg);
++retry:
+ 	if (new_page)
+ 		free_pages_nolock(new_page, 0);
+ 
+@@ -689,7 +721,7 @@ static int arena_map_mmap(struct bpf_map *map, struct vm_area_struct *vma)
+ 	 * of user_vm_start. Set VM_DONTCOPY to prevent arena VMA from
+ 	 * being copied into the child process on fork.
+ 	 */
+-	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTCOPY);
++	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTCOPY | VM_MIXEDMAP);
+ 	vma->vm_ops = &arena_vm_ops;
+ 	return 0;
+ }
+diff --git a/kernel/bpf/range_tree.c b/kernel/bpf/range_tree.c
+index 9472cf1bc26d..62ebf4df51cb 100644
+--- a/kernel/bpf/range_tree.c
++++ b/kernel/bpf/range_tree.c
+@@ -404,6 +404,20 @@ struct range_node *range_tree_set_unavail(struct range_tree *rt, u32 start, u32
+ 	return rn;
+ }
+ 
++int range_tree_remove_unavail(struct range_tree *rt, u32 start, u32 len)
++{
++	u32 last = start + len - 1;
++	struct range_node *rn;
++
++	rn = range_it_iter_first(rt, start, last);
++	if (!rn || rn->available || rn->rn_start != start || rn->rn_last != last)
++		return -EINVAL;
++
++	range_it_remove(rn, rt);
++	kfree_nolock(rn);
++	return 0;
++}
++
+ void range_tree_destroy(struct range_tree *rt)
+ {
+ 	struct range_node *rn;
+diff --git a/kernel/bpf/range_tree.h b/kernel/bpf/range_tree.h
+index 4f9ea2acea29..79295abe3684 100644
+--- a/kernel/bpf/range_tree.h
++++ b/kernel/bpf/range_tree.h
+@@ -19,6 +19,7 @@ int range_tree_clear(struct range_tree *rt, u32 start, u32 len);
+ int range_tree_set_avail(struct range_tree *rt, u32 start, u32 len);
+ struct range_node *range_tree_set_unavail(struct range_tree *rt, u32 start, u32 len);
+ void range_node_mark_available(struct range_node *rn);
++int range_tree_remove_unavail(struct range_tree *rt, u32 start, u32 len);
+ int range_tree_make_avail(struct range_tree *rt, u32 start, u32 len);
+ int is_range_tree_set(struct range_tree *rt, u32 start, u32 len);
+ s64 range_tree_find(struct range_tree *rt, u32 len);
+-- 
+2.52.0
+
