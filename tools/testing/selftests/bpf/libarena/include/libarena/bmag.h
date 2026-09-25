@@ -45,3 +45,9 @@ struct bdepot {
 };
 
 #define BDEPOT_CACHE(depot, cpu) ((depot)->percpu[(cpu)])
+
+/* Helpers for NMI reentrancy. */
+
+struct __attribute__((aligned(64))) bmag_active {
+	unsigned int value;
+};
