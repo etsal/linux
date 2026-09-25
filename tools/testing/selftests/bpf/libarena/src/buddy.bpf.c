@@ -404,7 +404,10 @@ enum {
 	BUDDY_POISONED = (s8)0xef,
 
 	/* Number of pages to be allocated per chunk. */
-	BUDDY_CHUNK_PAGES	= BUDDY_CHUNK_BYTES / __PAGE_SIZE
+	BUDDY_CHUNK_PAGES	= BUDDY_CHUNK_BYTES / __PAGE_SIZE,
+
+	/* Number of pages used by the bmag depot. */
+	BDEPOT_PAGES		= (sizeof(struct bdepot) + __PAGE_SIZE - 1) / __PAGE_SIZE,
 };
 
 /*
@@ -914,6 +917,58 @@ static struct buddy_chunk __arena *buddy_chunk_get(struct buddy __arena *buddy)
 	return chunk;
 }
 
+static int buddy_bdepot_init(struct buddy __arena *buddy)
+{
+	struct bdepot __arena *depot;
+	struct bmag __arena *bmag;
+	unsigned int cpu, i, order;
+	int ret;
+
+	DISABLE_BMAG_IF_ASAN(0);
+
+	if (CONFIG_NR_CPUS > BMAG_MAX_CPUS)
+		return -E2BIG;
+
+	depot = bpf_arena_alloc_pages(&arena, NULL, BDEPOT_PAGES, NUMA_NO_NODE, 0);
+	if (!depot)
+		return -ENOMEM;
+
+	for (order = zero; order < BMAG_NUM_ORDERS && can_loop; order++)
+		depot->full[order] = NULL;
+	depot->empty = NULL;
+
+	for (cpu = zero; cpu < CONFIG_NR_CPUS && can_loop; cpu++) {
+		ret = buddy_alloc_bulk(buddy, sizeof(*bmag),
+				       arena_fls(BMAG_NUM_ORDERS * BMAG_PERCPU_MAGS) - 1,
+				       (void __arena * __arena *)&depot->percpu[cpu].bmags[0][0]);
+		if (ret)
+			goto err_free_depot;
+
+		for (i = zero; i < BMAG_NUM_ORDERS * BMAG_PERCPU_MAGS && can_loop; i++) {
+			bmag = depot->percpu[cpu].bmags[i / BMAG_PERCPU_MAGS][i % BMAG_PERCPU_MAGS];
+			WRITE_ONCE(bmag->elems, 0);
+		}
+	}
+
+	buddy->bdepot = depot;
+
+	return 0;
+
+err_free_depot:
+	bpf_arena_free_pages(&arena, depot, BDEPOT_PAGES);
+
+	return ret;
+}
+
+static void buddy_bdepot_destroy(struct buddy __arena *buddy)
+{
+	if (!buddy->bdepot)
+		return;
+
+	bpf_arena_free_pages(&arena, buddy->bdepot, BDEPOT_PAGES);
+	buddy->bdepot = NULL;
+}
+
 __weak int buddy_init(struct buddy __arena *buddy)
 {
 	struct buddy_chunk __arena *chunk;
@@ -923,6 +978,7 @@ __weak int buddy_init(struct buddy __arena *buddy)
 	if (!asan_ready())
 		return -EINVAL;
 	buddy->deferred_free = NULL;
+	buddy->bdepot = NULL;
 
 	/* Reserve enough address space to ensure allocations are aligned. */
 	ret = buddy_reserve_arena_vaddr(buddy);
@@ -948,7 +1004,16 @@ __weak int buddy_init(struct buddy __arena *buddy)
 
 	buddy_unlock(buddy, flags);
 
-	return chunk ? 0 : -ENOMEM;
+	if (!chunk)
+		return -ENOMEM;
+
+	ret = buddy_bdepot_init(buddy);
+	if (ret) {
+		buddy_destroy(buddy);
+		return ret;
+	}
+
+	return 0;
 }
 
 /*
@@ -963,6 +1028,8 @@ __weak int buddy_destroy(struct buddy __arena *buddy)
 
 	if (!buddy)
 		return -EINVAL;
+
+	buddy_bdepot_destroy(buddy);
 
 	/*
 	 * Traverse all buddy chunks and free them back to the arena
