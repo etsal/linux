@@ -42,7 +42,8 @@
  */
 static u8 idx_get_order(struct buddy_chunk __arena *chunk, u64 idx);
 static u64 arena_next_pow2(__u64 n);
-static void __arena *buddy_alloc_memory(struct buddy __arena *buddy, size_t size, size_t norder);
+static void __arena *buddy_alloc_memory(struct buddy __arena *buddy, size_t size,
+					size_t norder, bool *bmag_refill_needed);
 static int buddy_free_unlocked(struct buddy __arena *buddy, u64 addr);
 static bool buddy_deferred_free_pending(struct buddy __arena *buddy);
 static int buddy_deferred_free_complete(struct buddy __arena *buddy);
@@ -100,6 +101,9 @@ static int bmag_move_mag(struct buddy __arena *buddy,
 
 	if (take_mag)
 		*take_mag = NULL;
+
+	if (bpf_in_nmi())
+		return -EAGAIN;
 
 	ret = buddy_lock(buddy, flags);
 	if (ret)
@@ -328,7 +332,7 @@ buddy_bmag_grow(struct buddy __arena *buddy, int order)
 	 * BDEPOT_ADJUST_STEP magazines and add any excess to the empty list.
 	 */
 	nmags = arena_next_pow2(BDEPOT_ADJUST_STEP);
-	addr = buddy_alloc_memory(buddy, sizeof(*bmag), arena_fls(nmags) - 1);
+	addr = buddy_alloc_memory(buddy, sizeof(*bmag), arena_fls(nmags) - 1, NULL);
 	if (!addr)
 		return -ENOMEM;
 
@@ -1181,7 +1185,8 @@ static u64 buddy_alloc_from_new_chunk(struct buddy __arena *buddy, struct buddy_
 
 	return (u64)address;
 }
-static void __arena *buddy_alloc_memory(struct buddy __arena *buddy, size_t size, size_t norder)
+static void __arena *buddy_alloc_memory(struct buddy __arena *buddy, size_t size,
+		size_t norder, bool *bmag_refill_needed)
 {
 	void __arena *address = NULL;
 	u8 __arena *object;
@@ -1191,6 +1196,9 @@ static void __arena *buddy_alloc_memory(struct buddy __arena *buddy, size_t size
 	unsigned long flags;
 	int order;
 
+	if (bmag_refill_needed)
+		*bmag_refill_needed = false;
+
 	if (!buddy)
 		return NULL;
 
@@ -1198,6 +1206,12 @@ static void __arena *buddy_alloc_memory(struct buddy __arena *buddy, size_t size
 	if (order < 0 || order >= BUDDY_CHUNK_NUM_ORDERS || norder >= BUDDY_CHUNK_NUM_ORDERS - order) {
 		arena_stderr("invalid order %d (norder %lu) (sz %lu)\n", order, norder, size);
 		return NULL;
+	}
+
+	if (!norder) {
+		address = buddy_bmag_alloc(buddy, order);
+		if (address)
+			goto done;
 	}
 
 	if (bpf_in_nmi())
@@ -1214,6 +1228,9 @@ static void __arena *buddy_alloc_memory(struct buddy __arena *buddy, size_t size
 	}
 
 	address = (u8 __arena *)buddy_alloc_from_existing_chunks(buddy, order, norder);
+	if (bmag_refill_needed)
+		*bmag_refill_needed = true;
+
 	buddy_unlock(buddy, flags);
 	if (address)
 		goto done;
@@ -1260,7 +1277,12 @@ int buddy_alloc_bulk(struct buddy __arena *buddy, size_t size, size_t norder,
 	if (!buddy || !out || norder >= BUDDY_CHUNK_NUM_ORDERS)
 		return -EINVAL;
 
-	address = buddy_alloc_memory(buddy, size, norder);
+	/*
+	 * Bulk allocations bypass the per-cpu caches and reserve one buddy
+	 * block covering all returned objects. The buddy metadata records
+	 * each object separately so it can later be freed independently.
+	 */
+	address = buddy_alloc_memory(buddy, size, norder, NULL);
 	if (!address)
 		return -ENOMEM;
 
@@ -1274,7 +1296,26 @@ int buddy_alloc_bulk(struct buddy __arena *buddy, size_t size, size_t norder,
 __weak
 void __arena *buddy_alloc(struct buddy __arena *buddy, size_t size)
 {
-	return buddy_alloc_memory(buddy, size, 0);
+	bool bmag_refill_needed;
+	void __arena *address;
+	int order;
+
+	address = buddy_alloc_memory(buddy, size, 0, &bmag_refill_needed);
+	order = size_to_order(size);
+
+	/*
+	 * If the bmag allocation failed, replenish it
+	 * opportunistically here. We do this at the top
+	 * level to avoid accidental recursion and to
+	 * minimize the maximum BPF stack size. If the
+	 * allocation actually failed, don't try to
+	 * refill the cache in order to avoid even more
+	 * memory pressure.
+	 */
+	if (bmag_refill_needed && address)
+		buddy_bmag_grow(buddy, order);
+
+	return address;
 }
 
 static int buddy_free_unlocked(struct buddy __arena *buddy, u64 addr)
@@ -1453,6 +1494,7 @@ static int buddy_deferred_free_complete(struct buddy __arena *buddy)
 __weak int buddy_free(struct buddy __arena *buddy, void __arena *addr)
 {
 	unsigned long flags;
+	int order;
 	int ret;
 
 	if (!buddy)
@@ -1460,6 +1502,10 @@ __weak int buddy_free(struct buddy __arena *buddy, void __arena *addr)
 
 	/* Freeing NULL is a valid no-op. */
 	if (!addr)
+		return 0;
+
+	ret = buddy_bmag_free(buddy, addr);
+	if (!ret)
 		return 0;
 
 	if (bpf_in_nmi()) {
@@ -1471,6 +1517,7 @@ __weak int buddy_free(struct buddy __arena *buddy, void __arena *addr)
 	if (ret)
 		return ret;
 
+	order = buddy_bmag_get_order(addr);
 	ret = buddy_free_unlocked(buddy, (u64)addr);
 
 	/* Drain any frees stranded during an NMI. */
@@ -1479,6 +1526,9 @@ __weak int buddy_free(struct buddy __arena *buddy, void __arena *addr)
 		if (ret)
 			goto out_unlock;
 	}
+
+	/* If necessary, shrink the allocator. */
+	buddy_bmag_shrink(buddy, order);
 
 out_unlock:
 	buddy_unlock(buddy, flags);
