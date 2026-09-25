@@ -4,6 +4,7 @@
 #include <libarena/common.h>
 #include <libarena/asan.h>
 #include <libarena/buddy.h>
+#include <libarena/bmag.h>
 
 #include <bpf_arena_spin_lock.h>
 
@@ -38,7 +39,321 @@
  * and their allocation state. It also includes the freelist
  * heads for the allocation itself.
  */
+static u8 idx_get_order(struct buddy_chunk __arena *chunk, u64 idx);
+static u64 arena_next_pow2(__u64 n);
+static void __arena *buddy_alloc_memory(struct buddy __arena *buddy, size_t size, size_t norder);
+static int buddy_free_unlocked(struct buddy __arena *buddy, u64 addr);
 
+#define buddy_lock(buddy, flags) (arena_spin_lock_irqsave(&(buddy)->lock, (flags)))
+#define buddy_unlock(buddy, flags) (arena_spin_unlock_irqrestore(&(buddy)->lock, (flags)))
+
+/*
+ * Magazine caching is disabled in ASAN builds because its additional call-chain
+ * stack usage causes instrumented programs to exceed BPF's 512-byte stack limit.
+ */
+#ifdef BPF_ARENA_ASAN
+#define DISABLE_BMAG_IF_ASAN(...) do { return (__VA_ARGS__); } while (0)
+#else
+#define DISABLE_BMAG_IF_ASAN(...)
+#endif
+
+static void bmag_push_mag_locked(struct bmag __arena * __arena *list,
+				 struct bmag __arena *bmag)
+{
+	bmag->next = *list;
+	*list = bmag;
+}
+
+static struct bmag __arena *bmag_get_mag_locked(struct bmag __arena * __arena *list)
+{
+	struct bmag __arena *head;
+
+	head = *list;
+	if (head)
+		*list = head->next;
+
+	return head;
+}
+
+static int bmag_move_mag(struct buddy __arena *buddy,
+			 struct bmag __arena *put_mag,
+			 struct bmag __arena * __arena *put_list,
+			 struct bmag __arena **take_mag,
+			 struct bmag __arena * __arena *take_list)
+{
+	unsigned long flags;
+	int ret;
+
+	if (take_mag)
+		*take_mag = NULL;
+
+	ret = buddy_lock(buddy, flags);
+	if (ret)
+		return ret;
+
+	if (take_list) {
+		*take_mag = bmag_get_mag_locked(take_list);
+		if (!*take_mag)
+			goto out_unlock;
+	}
+
+	if (put_list)
+		bmag_push_mag_locked(put_list, put_mag);
+
+out_unlock:
+	buddy_unlock(buddy, flags);
+
+	return 0;
+}
+
+static void __arena *bdepot_alloc(struct bdepot __arena *depot, int order)
+{
+	void __arena *addr = NULL;
+	struct bmag __arena *bmag;
+	unsigned int i;
+	size_t elems;
+
+	for (i = zero; i < BMAG_PERCPU_MAGS; i++) {
+		bmag = BDEPOT_MAG(depot, order, i);
+		elems = READ_ONCE(bmag->elems);
+		if (!elems)
+			continue;
+
+		addr = READ_ONCE(bmag->objects[elems - 1]);
+		WRITE_ONCE(bmag->elems, elems - 1);
+
+		return addr;
+	}
+
+	return NULL;
+}
+
+static int bdepot_free(struct bdepot __arena *depot, int order, void __arena *obj)
+{
+	struct bmag __arena *bmag;
+	unsigned int i;
+	size_t elems;
+
+	for (i = zero; i < BMAG_PERCPU_MAGS; i++) {
+		bmag = BDEPOT_MAG(depot, order, i);
+
+		elems = READ_ONCE(bmag->elems);
+		if (elems >= BMAG_CAPACITY)
+			continue;
+
+		WRITE_ONCE(bmag->objects[elems], obj);
+		WRITE_ONCE(bmag->elems, elems + 1);
+
+		return 0;
+	}
+
+	return -ENOMEM;
+}
+
+void __arena *buddy_bmag_alloc(struct buddy __arena *buddy, size_t order)
+{
+	struct bdepot __arena *depot = buddy->bdepot;
+	struct bmag __arena *full, *empty;
+	void __arena *address = NULL;
+
+	DISABLE_BMAG_IF_ASAN(NULL);
+
+	if (order >= BMAG_NUM_ORDERS)
+		return NULL;
+
+	address = bdepot_alloc(depot, order);
+	if (address)
+		return address;
+
+	/*
+	 * Get a full mag from the depot and place the
+	 * empty one back.
+	 */
+	empty = BDEPOT_PREV(depot, order);
+	if (bmag_move_mag(buddy, empty, &depot->empty, &full, &depot->full[order]))
+		return NULL;
+	if (!full)
+		return NULL;
+	WRITE_ONCE(full->elems, BMAG_CAPACITY);
+
+	BDEPOT_PREV(depot, order) = BDEPOT_CUR(depot, order);
+	BDEPOT_CUR(depot, order) = full;
+
+	return bdepot_alloc(depot, order);
+}
+
+/* Retrieve the order of an allocation from the address. */
+static int buddy_bmag_get_order(void __arena *addr)
+{
+	struct buddy_chunk __arena *chunk;
+	u64 idx;
+
+	chunk = (void __arena *)((u64)addr & ~BUDDY_CHUNK_OFFSET_MASK);
+	idx = ((u64)addr & BUDDY_CHUNK_OFFSET_MASK) / BUDDY_MIN_ALLOC_BYTES;
+
+	return idx_get_order(chunk, idx);
+}
+
+int buddy_bmag_free(struct buddy __arena *buddy, void __arena *addr)
+{
+	struct bdepot __arena *depot = buddy->bdepot;
+	struct bmag __arena *full, *empty;
+	int order;
+	int ret = 0;
+
+	DISABLE_BMAG_IF_ASAN(-EINVAL);
+
+	order = buddy_bmag_get_order(addr);
+	if (order >= BMAG_NUM_ORDERS)
+		return -EINVAL;
+
+	ret = bdepot_free(depot, order, addr);
+	if (!ret)
+		return ret;
+
+	/*
+	 * Get an empty mag from the depot and place the
+	 * full one back.
+	 */
+	full = BDEPOT_PREV(depot, order);
+	ret = bmag_move_mag(buddy, full, &depot->full[order], &empty, &depot->empty);
+	if (ret)
+		return ret;
+	if (!empty) {
+		/*
+		 * No empty mags. Do not allocate one here.
+		 * The empty mags list will be
+		 * eventually populated as allocations drain
+		 * existing mags, and new ones are created
+		 * as we refill the depot during allocations.
+		 */
+		return -EINVAL;
+	}
+	WRITE_ONCE(empty->elems, 0);
+
+	BDEPOT_PREV(depot, order) = BDEPOT_CUR(depot, order);
+	BDEPOT_CUR(depot, order) = empty;
+
+	/* Free into the new mag. */
+	return bdepot_free(depot, order, addr);
+}
+
+int
+buddy_bmag_grow(struct buddy __arena *buddy, int order)
+{
+	struct bdepot __arena *depot = buddy->bdepot;
+	struct bmag __arena *bmag, *head, *next;
+	void __arena *addr;
+	u64 nmags, off;
+	unsigned int step;
+	unsigned int i;
+	int ret = 0;
+	int err;
+
+	DISABLE_BMAG_IF_ASAN(0);
+
+	if (order >= BMAG_NUM_ORDERS)
+		return -E2BIG;
+
+	/* Reuse empty magazines before allocating new ones. */
+	head = NULL;
+	for (i = zero; i < BDEPOT_ADJUST_STEP && can_loop; i++) {
+		err = bmag_move_mag(buddy, NULL, NULL, &bmag, &depot->empty);
+		if (err)
+			return ret ?: err;
+		if (!bmag)
+			break;
+		bmag->next = head;
+		head = bmag;
+	}
+
+	if (i == BDEPOT_ADJUST_STEP)
+		goto empty_mags_found;
+
+	/* Not enough empty magazines were available; return the partial batch. */
+	for (bmag = head; bmag && can_loop; bmag = next) {
+		next = bmag->next;
+		err = bmag_move_mag(buddy, bmag, &depot->empty, NULL, NULL);
+		if (err)
+			return ret ?: err;
+	}
+
+	/*
+	 * Allocate a power-of-two batch of magazine storage. Keep
+	 * BDEPOT_ADJUST_STEP magazines and add any excess to the empty list.
+	 */
+	nmags = arena_next_pow2(BDEPOT_ADJUST_STEP);
+	addr = buddy_alloc_memory(buddy, sizeof(*bmag), arena_fls(nmags) - 1);
+	if (!addr)
+		return -ENOMEM;
+
+	step = BUDDY_MIN_ALLOC_BYTES << buddy_bmag_get_order(addr);
+	head = NULL;
+	for (i = zero, off = zero; i < nmags && can_loop; i++, off += step) {
+		bmag = (struct bmag __arena *)&((u8 __arena *)addr)[off];
+		if (i >= BDEPOT_ADJUST_STEP) {
+			err = bmag_move_mag(buddy, bmag, &depot->empty, NULL, NULL);
+			if (err)
+				return ret ?: err;
+			continue;
+		}
+		bmag->next = head;
+		head = bmag;
+	}
+
+empty_mags_found:
+	/* Fill each magazine with a bulk allocation of objects. */
+	for (bmag = head; bmag && can_loop; bmag = next) {
+		next = bmag->next;
+		err = buddy_alloc_bulk(buddy, BUDDY_MIN_ALLOC_BYTES << order,
+				       arena_fls(BMAG_CAPACITY) - 1, bmag->objects);
+		if (err) {
+			ret = ret ?: err;
+			err = bmag_move_mag(buddy, bmag, &depot->empty, NULL, NULL);
+			if (err)
+				return ret ?: err;
+			continue;
+		}
+		WRITE_ONCE(bmag->elems, BMAG_CAPACITY);
+		err = bmag_move_mag(buddy, bmag, &depot->full[order], NULL, NULL);
+		if (err)
+			return ret ?: err;
+	}
+
+	return ret;
+}
+
+int
+buddy_bmag_shrink(struct buddy __arena *buddy, int order)
+{
+	struct bdepot __arena *depot = buddy->bdepot;
+	struct bmag __arena *bmag;
+	unsigned int i, j;
+	int ret = 0;
+	int err;
+
+	DISABLE_BMAG_IF_ASAN(0);
+
+	if (order >= BMAG_NUM_ORDERS)
+		return -E2BIG;
+
+	/* The caller holds the buddy lock. */
+	for (j = zero; j < BDEPOT_ADJUST_STEP && can_loop; j++) {
+		bmag = bmag_get_mag_locked(&depot->full[order]);
+		if (!bmag)
+			break;
+
+		for (i = zero; i < BMAG_CAPACITY && can_loop; i++) {
+			err = buddy_free_unlocked(buddy, (u64)bmag->objects[i]);
+			ret = ret ?: err;
+		}
+
+		err = buddy_free_unlocked(buddy, (u64)bmag);
+		ret = ret ?: err;
+	}
+
+	return ret;
+}
 
 enum {
 	BUDDY_POISONED = (s8)0xef,
@@ -46,9 +361,6 @@ enum {
 	/* Number of pages to be allocated per chunk. */
 	BUDDY_CHUNK_PAGES	= BUDDY_CHUNK_BYTES / __PAGE_SIZE
 };
-
-#define buddy_lock(buddy, flags) (arena_spin_lock_irqsave(&(buddy)->lock, (flags)))
-#define buddy_unlock(buddy, flags) (arena_spin_unlock_irqrestore(&(buddy)->lock, (flags)))
 
 /*
  * Reserve part of the arena address space for the allocator. We use

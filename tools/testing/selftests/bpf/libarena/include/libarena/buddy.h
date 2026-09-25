@@ -49,6 +49,8 @@ struct buddy_header {
 	u32 next_index; /* Same for the next allocation. */
 };
 
+struct bdepot;
+
 /*
  * We bring memory into the allocator 1 MiB at a time.
  */
@@ -69,6 +71,7 @@ struct buddy {
 	struct buddy_chunk __arena *first_chunk;		/* Pointer to the chunk linked list. */
 	arena_spinlock_t lock;			/* Allocator lock */
 	u64 vaddr;				/* Allocation into reserved vaddr */
+	struct bdepot __arena		*bdepot;
 };
 
 #ifdef __BPF__
