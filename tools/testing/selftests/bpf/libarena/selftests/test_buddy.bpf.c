@@ -34,10 +34,19 @@ __weak int test_buddy_create(void)
 		if (ret)
 			return ret;
 
+#ifndef BPF_ARENA_ASAN
+		if (!buddy.bdepot) {
+			buddy_destroy(&buddy);
+			return -EINVAL;
+		}
+#endif
+
 		ret = buddy_destroy(&buddy);
 		if (ret)
 			return ret;
 		if (buddy.deferred_free)
+			return -EINVAL;
+		if (buddy.bdepot)
 			return -EINVAL;
 	}
 
