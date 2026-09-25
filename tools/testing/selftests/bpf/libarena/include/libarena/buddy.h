@@ -63,6 +63,8 @@ struct buddy_chunk {
 	 * chunk found from the orders array.
 	 */
 	u8		allocated[BUDDY_CHUNK_ITEMS / 8];
+	/* Records objects whose free has begun, including objects in a cache. */
+	u64		free_claimed[BUDDY_CHUNK_ITEMS / 64];
 	/* Freelists for O(1) allocation. */
 	u64		freelists[BUDDY_CHUNK_NUM_ORDERS];
 	struct buddy_chunk __arena	*next;

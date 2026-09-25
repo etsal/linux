@@ -41,6 +41,8 @@
  * heads for the allocation itself.
  */
 static u8 idx_get_order(struct buddy_chunk __arena *chunk, u64 idx);
+static int idx_is_allocated(struct buddy_chunk __arena *chunk, u64 idx,
+			    bool *allocated);
 static u64 arena_next_pow2(__u64 n);
 static u64 size_to_order(size_t size);
 static void __arena *buddy_alloc_memory(struct buddy __arena *buddy, size_t size,
@@ -63,6 +65,52 @@ static struct bmag_active active[BMAG_MAX_CPUS];
 #define DISABLE_BMAG_IF_ASAN(...)
 #endif
 
+/*
+ * Keep claim bits for adjacent objects off the same cache line. Bulk refills
+ * allocate contiguous objects to different CPUs, so using the object index
+ * directly would turn this validation state into a false-sharing hotspot.
+ * Multiplication by an odd number is a permutation modulo the power-of-two
+ * item count and therefore preserves a unique bit for every object.
+ *
+ * The verifier does not permit atomic operations on arena memory. The claim
+ * table detects invalid repeated frees under the allocator's normal ownership
+ * contract; it is not synchronization for simultaneous frees of one object.
+ */
+static __always_inline u64 buddy_free_claim_idx(u64 idx)
+{
+	return (idx * 40503) & (BUDDY_CHUNK_ITEMS - 1);
+}
+
+static __always_inline bool buddy_set_free_claim(void __arena *addr)
+{
+	struct buddy_chunk __arena *chunk;
+	u64 idx, mask, old;
+
+	chunk = (void __arena *)((u64)addr & ~BUDDY_CHUNK_OFFSET_MASK);
+	idx = ((u64)addr & BUDDY_CHUNK_OFFSET_MASK) / BUDDY_MIN_ALLOC_BYTES;
+	idx = buddy_free_claim_idx(idx);
+	mask = 1ULL << (idx % 64);
+	old = READ_ONCE(chunk->free_claimed[idx / 64]);
+	WRITE_ONCE(chunk->free_claimed[idx / 64], old | mask);
+
+	return old & mask;
+}
+
+static __always_inline bool buddy_clear_free_claim(void __arena *addr)
+{
+	struct buddy_chunk __arena *chunk;
+	u64 idx, mask, old;
+
+	chunk = (void __arena *)((u64)addr & ~BUDDY_CHUNK_OFFSET_MASK);
+	idx = ((u64)addr & BUDDY_CHUNK_OFFSET_MASK) / BUDDY_MIN_ALLOC_BYTES;
+	idx = buddy_free_claim_idx(idx);
+	mask = 1ULL << (idx % 64);
+	old = READ_ONCE(chunk->free_claimed[idx / 64]);
+	WRITE_ONCE(chunk->free_claimed[idx / 64], old & ~mask);
+
+	return old & mask;
+}
+
 static __always_inline void __arena *
 bmag_alloc(struct bmag_cache __arena *cache, int order)
 {
@@ -77,6 +125,9 @@ bmag_alloc(struct bmag_cache __arena *cache, int order)
 
 	addr = READ_ONCE(slots->objects[elems - 1]);
 	WRITE_ONCE(slots->elems, elems - 1);
+
+	if (unlikely(!buddy_clear_free_claim(addr)))
+		return NULL;
 
 	return addr;
 }
@@ -128,36 +179,50 @@ void __arena *buddy_bmag_alloc(struct buddy __arena *buddy, size_t order)
 	WRITE_ONCE(cpu_active->value, active_count + 1);
 
 	address = bmag_alloc(cache, order);
-
 	WRITE_ONCE(cpu_active->value, active_count);
 
 	return address;
 }
 
-/* Retrieve the order of an allocation from the address. */
-static int buddy_bmag_get_order(void __arena *addr)
+static int buddy_claim_free(void __arena *addr, int *orderp)
 {
 	struct buddy_chunk __arena *chunk;
+	bool allocated;
 	u64 idx;
+	int order;
+	int ret;
+
+	if ((u64)addr & (BUDDY_MIN_ALLOC_BYTES - 1))
+		return -EINVAL;
 
 	chunk = (void __arena *)((u64)addr & ~BUDDY_CHUNK_OFFSET_MASK);
 	idx = ((u64)addr & BUDDY_CHUNK_OFFSET_MASK) / BUDDY_MIN_ALLOC_BYTES;
+	ret = idx_is_allocated(chunk, idx, &allocated);
+	if (ret || !allocated)
+		return -EINVAL;
 
-	return idx_get_order(chunk, idx);
+	order = idx_get_order(chunk, idx);
+	if (order >= BUDDY_CHUNK_NUM_ORDERS ||
+	    (idx & ((1ULL << order) - 1)))
+		return -EINVAL;
+
+	if (buddy_set_free_claim(addr))
+		return -EINVAL;
+
+	*orderp = order;
+	return 0;
 }
 
-int buddy_bmag_free(struct buddy __arena *buddy, void __arena *addr)
+int buddy_bmag_free(struct buddy __arena *buddy, void __arena *addr, int order)
 {
 	struct bdepot __arena *depot = buddy->bdepot;
 	struct bmag_cache __arena *cache;
 	struct bmag_active *cpu_active;
 	unsigned int active_count, cpu;
-	int order;
 	int ret = 0;
 
 	DISABLE_BMAG_IF_ASAN(-EINVAL);
 
-	order = buddy_bmag_get_order(addr);
 	if (order >= BMAG_NUM_ORDERS)
 		return -EINVAL;
 
@@ -170,10 +235,56 @@ int buddy_bmag_free(struct buddy __arena *buddy, void __arena *addr)
 	WRITE_ONCE(cpu_active->value, active_count + 1);
 
 	ret = bmag_free(cache, order, addr);
-
 	WRITE_ONCE(cpu_active->value, active_count);
 
 	return ret;
+}
+
+static void __arena *buddy_bmag_refill(struct buddy __arena *buddy,
+				       size_t size, int order)
+{
+	struct bdepot __arena *depot = buddy->bdepot;
+	struct bmag_cache_order __arena *slots;
+	struct bmag_cache __arena *cache;
+	struct bmag_active *cpu_active;
+	void __arena *address = NULL;
+	unsigned int active_count, cpu, i;
+	int ret;
+
+	DISABLE_BMAG_IF_ASAN(NULL);
+
+	if (order >= BMAG_NUM_ORDERS)
+		return NULL;
+
+	cpu = bpf_get_smp_processor_id();
+	cache = BDEPOT_CACHE(depot, cpu);
+	cpu_active = &active[cpu];
+	active_count = READ_ONCE(cpu_active->value);
+	if (active_count > 0)
+		return NULL;
+	WRITE_ONCE(cpu_active->value, active_count + 1);
+
+	/* A free may have populated the cache between the miss and refill. */
+	address = bmag_alloc(cache, order);
+	if (address)
+		goto done;
+
+	slots = &cache->orders[order];
+	ret = buddy_alloc_bulk(buddy, size, arena_fls(BMAG_CAPACITY) - 1,
+				(void __arena * __arena *)slots->objects);
+	if (ret)
+		goto done;
+
+	for (i = zero; i < BMAG_CAPACITY - 1 && can_loop; i++)
+		buddy_set_free_claim(slots->objects[i]);
+
+	address = slots->objects[BMAG_CAPACITY - 1];
+	WRITE_ONCE(slots->elems, BMAG_CAPACITY - 1);
+
+done:
+	WRITE_ONCE(cpu_active->value, active_count);
+
+	return address;
 }
 
 enum {
@@ -283,10 +394,15 @@ int idx_set_allocated(struct buddy_chunk __arena *chunk, u64 idx, bool allocated
 		return -EINVAL;
 	}
 
-	if (allocated)
+	if (allocated) {
+		u64 claim_idx = buddy_free_claim_idx(idx);
+
 		chunk->allocated[idx / 8] |= 1 << (idx % 8);
-	else
+		chunk->free_claimed[claim_idx / 64] &=
+			~(1ULL << (claim_idx % 64));
+	} else {
 		chunk->allocated[idx / 8] &= ~(1 << (idx % 8));
+	}
 
 	return 0;
 }
@@ -1030,6 +1146,11 @@ int buddy_alloc_bulk(struct buddy __arena *buddy, size_t size, size_t norder,
 	if (!buddy || !out || norder >= BUDDY_CHUNK_NUM_ORDERS)
 		return -EINVAL;
 
+	/*
+	 * Bulk allocations bypass the per-cpu caches and reserve one buddy
+	 * block covering all returned objects. The buddy metadata records
+	 * each object separately so it can later be freed independently.
+	 */
 	order = size_to_order(size);
 	address = buddy_alloc_memory(buddy, size, order, norder);
 	if (!address)
@@ -1045,7 +1166,22 @@ int buddy_alloc_bulk(struct buddy __arena *buddy, size_t size, size_t norder,
 __weak
 void __arena *buddy_alloc(struct buddy __arena *buddy, size_t size)
 {
-	return buddy_alloc_memory(buddy, size, size_to_order(size), 0);
+	void __arena *address;
+	int order;
+
+	order = size_to_order(size);
+	address = buddy_bmag_alloc(buddy, order);
+	if (address)
+		return address;
+
+	if (bpf_in_nmi())
+		return NULL;
+
+	address = buddy_bmag_refill(buddy, size, order);
+	if (address)
+		return address;
+
+	return buddy_alloc_memory(buddy, size, order, 0);
 }
 
 static int buddy_free_unlocked(struct buddy __arena *buddy, u64 addr)
@@ -1152,11 +1288,13 @@ static void buddy_deferred_free_start(struct buddy __arena *buddy, void __arena 
 			 head, (void __arena *)new) != head && can_loop);
 }
 
-static void buddy_deferred_free_start_bulk(struct buddy __arena *buddy,
+static int buddy_deferred_free_start_bulk(struct buddy __arena *buddy,
 		 void __arena * __arena *addrs, size_t naddrs)
 {
 	void __arena *head, *first, *last, *addr;
 	unsigned int i;
+	int order, err;
+	int ret = 0;
 
 	/* Create a linked list locally. */
 	first = NULL;
@@ -1165,6 +1303,12 @@ static void buddy_deferred_free_start_bulk(struct buddy __arena *buddy,
 		addr = addrs[i];
 		if (!addr)
 			continue;
+
+		err = buddy_claim_free(addr, &order);
+		if (err) {
+			ret = ret ?: err;
+			continue;
+		}
 
 		asan_unpoison(addr, sizeof(void *));
 
@@ -1177,7 +1321,7 @@ static void buddy_deferred_free_start_bulk(struct buddy __arena *buddy,
 	}
 
 	if (!first)
-		return;
+		return ret;
 
 	/*
 	 * Make a linked list by chaining the allocations into a linked list.
@@ -1188,6 +1332,8 @@ static void buddy_deferred_free_start_bulk(struct buddy __arena *buddy,
 		*(void __arena * __arena *)last = head;
 	} while (cmpxchg((void __arena * __arena *)&buddy->deferred_free,
 			 head, first) != head && can_loop);
+
+	return ret;
 }
 
 static int buddy_deferred_free_complete(struct buddy __arena *buddy)
@@ -1224,6 +1370,7 @@ static int buddy_deferred_free_complete(struct buddy __arena *buddy)
 __weak int buddy_free(struct buddy __arena *buddy, void __arena *addr)
 {
 	unsigned long flags;
+	int order;
 	int ret;
 
 	if (!buddy)
@@ -1233,14 +1380,24 @@ __weak int buddy_free(struct buddy __arena *buddy, void __arena *addr)
 	if (!addr)
 		return 0;
 
+	ret = buddy_claim_free(addr, &order);
+	if (ret)
+		return ret;
+
+	ret = buddy_bmag_free(buddy, addr, order);
+	if (!ret)
+		return 0;
+
 	if (bpf_in_nmi()) {
 		buddy_deferred_free_start(buddy, addr);
 		return 0;
 	}
 
 	ret = buddy_lock(buddy, flags);
-	if (ret)
+	if (ret) {
+		buddy_clear_free_claim(addr);
 		return ret;
+	}
 
 	ret = buddy_free_unlocked(buddy, (u64)addr);
 
@@ -1261,7 +1418,7 @@ __weak int buddy_free_bulk(struct buddy __arena *buddy, void __arena * __arena *
 {
 	unsigned long flags;
 	unsigned int i;
-	int err;
+	int order, err;
 	int ret = 0;
 
 	if (!buddy)
@@ -1273,10 +1430,8 @@ __weak int buddy_free_bulk(struct buddy __arena *buddy, void __arena * __arena *
 	if (!addrs)
 		return -EINVAL;
 
-	if (bpf_in_nmi()) {
-		buddy_deferred_free_start_bulk(buddy, addrs, naddrs);
-		return 0;
-	}
+	if (bpf_in_nmi())
+		return buddy_deferred_free_start_bulk(buddy, addrs, naddrs);
 
 	ret = buddy_lock(buddy, flags);
 	if (ret)
@@ -1286,6 +1441,12 @@ __weak int buddy_free_bulk(struct buddy __arena *buddy, void __arena * __arena *
 		/* NULL pointers are ignored. */
 		if (!addrs[i])
 			continue;
+
+		err = buddy_claim_free(addrs[i], &order);
+		if (err) {
+			ret = ret ?: err;
+			continue;
+		}
 
 		err = buddy_free_unlocked(buddy, (u64)addrs[i]);
 		ret = ret ?: err;

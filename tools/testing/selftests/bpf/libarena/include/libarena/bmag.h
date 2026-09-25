@@ -23,8 +23,8 @@ enum bmag_consts {
 	BMAG_CAPACITY = 8,
 
 	/*
-	 * Preserve the capacity of two magazines while storing all slots directly
-	 * in a packed per-order slab.
+	 * Preserve the capacity of the previous two-magazine cache while storing
+	 * all slots directly in a packed per-order slab.
 	 */
 	BMAG_CACHE_CAPACITY = BMAG_CAPACITY * 2,
 };
