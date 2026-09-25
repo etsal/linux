@@ -71,3 +71,9 @@ struct bdepot {
 	((depot)->percpu[bpf_get_smp_processor_id()].bmags[(order)][(ind)])
 #define BDEPOT_CUR(depot, order)	BDEPOT_MAG((depot), (order), 0)
 #define BDEPOT_PREV(depot, order)	BDEPOT_MAG((depot), (order), 1)
+
+/* Helpers for NMI reentrancy. */
+
+struct __attribute__((aligned(64))) bmag_active {
+	unsigned int value;
+};
