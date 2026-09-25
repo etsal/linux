@@ -4,6 +4,7 @@
 #include <libarena/common.h>
 #include <libarena/asan.h>
 #include <libarena/buddy.h>
+#include <libarena/bmag.h>
 
 #include <bpf_arena_spin_lock.h>
 
@@ -38,7 +39,108 @@
  * and their allocation state. It also includes the freelist
  * heads for the allocation itself.
  */
+static u8 idx_get_order(struct buddy_chunk __arena *chunk, u64 idx);
+static u64 arena_next_pow2(__u64 n);
+static u64 size_to_order(size_t size);
+static void __arena *buddy_alloc_memory(struct buddy __arena *buddy, size_t size,
+					int order, size_t norder);
+static int buddy_free_unlocked(struct buddy __arena *buddy, u64 addr);
 
+#define buddy_lock(buddy, flags) (arena_spin_lock_irqsave(&(buddy)->lock, (flags)))
+#define buddy_unlock(buddy, flags) (arena_spin_unlock_irqrestore(&(buddy)->lock, (flags)))
+
+/*
+ * Magazine caching is disabled in ASAN builds because its additional call-chain
+ * stack usage causes instrumented programs to exceed BPF's 512-byte stack limit.
+ */
+#ifdef BPF_ARENA_ASAN
+#define DISABLE_BMAG_IF_ASAN(...) do { return (__VA_ARGS__); } while (0)
+#else
+#define DISABLE_BMAG_IF_ASAN(...)
+#endif
+
+static __always_inline void __arena *
+bmag_alloc(struct bmag_cache __arena *cache, int order)
+{
+	struct bmag_cache_order __arena *slots;
+	void __arena *addr;
+	u32 elems;
+
+	slots = &cache->orders[order];
+	elems = READ_ONCE(slots->elems);
+	if (unlikely(!elems))
+		return NULL;
+
+	addr = READ_ONCE(slots->objects[elems - 1]);
+	WRITE_ONCE(slots->elems, elems - 1);
+
+	return addr;
+}
+
+static __always_inline int bmag_free(struct bmag_cache __arena *cache,
+				     int order, void __arena *obj)
+{
+	struct bmag_cache_order __arena *slots;
+	u32 elems;
+
+	slots = &cache->orders[order];
+	elems = READ_ONCE(slots->elems);
+	if (unlikely(elems >= BMAG_CACHE_CAPACITY))
+		return -ENOMEM;
+
+	WRITE_ONCE(slots->objects[elems], obj);
+	WRITE_ONCE(slots->elems, elems + 1);
+
+	return 0;
+}
+
+void __arena *buddy_bmag_alloc(struct buddy __arena *buddy, size_t order)
+{
+	struct bdepot __arena *depot = buddy->bdepot;
+	struct bmag_cache __arena *cache;
+	unsigned int cpu;
+
+	DISABLE_BMAG_IF_ASAN(NULL);
+
+	if (order >= BMAG_NUM_ORDERS)
+		return NULL;
+
+	cpu = bpf_get_smp_processor_id();
+	cache = BDEPOT_CACHE(depot, cpu);
+
+	return bmag_alloc(cache, order);
+}
+
+/* Retrieve the order of an allocation from the address. */
+static int buddy_bmag_get_order(void __arena *addr)
+{
+	struct buddy_chunk __arena *chunk;
+	u64 idx;
+
+	chunk = (void __arena *)((u64)addr & ~BUDDY_CHUNK_OFFSET_MASK);
+	idx = ((u64)addr & BUDDY_CHUNK_OFFSET_MASK) / BUDDY_MIN_ALLOC_BYTES;
+
+	return idx_get_order(chunk, idx);
+}
+
+int buddy_bmag_free(struct buddy __arena *buddy, void __arena *addr)
+{
+	struct bdepot __arena *depot = buddy->bdepot;
+	struct bmag_cache __arena *cache;
+	unsigned int cpu;
+	int order;
+
+	DISABLE_BMAG_IF_ASAN(-EINVAL);
+
+	order = buddy_bmag_get_order(addr);
+	if (order >= BMAG_NUM_ORDERS)
+		return -EINVAL;
+
+	cpu = bpf_get_smp_processor_id();
+	cache = BDEPOT_CACHE(depot, cpu);
+
+	return bmag_free(cache, order, addr);
+}
 
 enum {
 	BUDDY_POISONED = (s8)0xef,
@@ -46,9 +148,6 @@ enum {
 	/* Number of pages to be allocated per chunk. */
 	BUDDY_CHUNK_PAGES	= BUDDY_CHUNK_BYTES / __PAGE_SIZE
 };
-
-#define buddy_lock(buddy, flags) (arena_spin_lock_irqsave(&(buddy)->lock, (flags)))
-#define buddy_unlock(buddy, flags) (arena_spin_unlock_irqrestore(&(buddy)->lock, (flags)))
 
 /*
  * Reserve part of the arena address space for the allocator. We use
