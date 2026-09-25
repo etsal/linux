@@ -1,0 +1,239 @@
+From d65abfa881481e5aa1a9c9726f3768854b187b3d Mon Sep 17 00:00:00 2001
+From: Emil Tsalapatis <emil@etsalapatis.com>
+Date: Thu, 24 Sep 2026 18:01:31 -0700
+Subject: [PATCH bpf-next v4 7/7] selftests/bpf: Test per-call site function
+ specialization
+
+Add a test to ensure function call specialization is
+done per-call site. Use bpf_dynptr_from_file that has
+observably different behavior between its sleepable and
+nonsleepable versions. The sleepable path fails in the
+sleepable __kernel_read() call with -EIO, while the
+nonsleepable fails in the page-cache lookup path with
+-EFAULT. Test that whatever the order the nonsleepable
+and sleepable calls are made in the program, both
+call sites use the correct specialized kfunc.
+
+Signed-off-by: Emil Tsalapatis <emil@etsalapatis.com>
+---
+ .../selftests/bpf/prog_tests/file_reader.c    |  15 ++
+ .../testing/selftests/bpf/progs/file_reader.c | 129 ++++++++++++++++++
+ 2 files changed, 144 insertions(+)
+
+diff --git a/tools/testing/selftests/bpf/prog_tests/file_reader.c b/tools/testing/selftests/bpf/prog_tests/file_reader.c
+index 48aae7ea0e4b..e59c6c87e9d5 100644
+--- a/tools/testing/selftests/bpf/prog_tests/file_reader.c
++++ b/tools/testing/selftests/bpf/prog_tests/file_reader.c
+@@ -7,10 +7,12 @@
+ #include "file_reader_fail.skel.h"
+ #include <dlfcn.h>
+ #include <sys/mman.h>
++#include <sys/stat.h>
+ 
+ const char *user_ptr = "hello world";
+ char file_contents[256000];
+ void *addr;
++__u64 beyond_eof_offset;
+ 
+ void *get_executable_base_addr(void)
+ {
+@@ -26,12 +28,18 @@ void *get_executable_base_addr(void)
+ 
+ static int initialize_file_contents(void)
+ {
++	struct stat st;
+ 	int fd, page_sz = sysconf(_SC_PAGESIZE);
+ 	ssize_t n = 0, cur;
+ 
+ 	fd = open("/proc/self/exe", O_RDONLY);
+ 	if (!ASSERT_OK_FD(fd, "Open /proc/self/exe\n"))
+ 		return 1;
++	if (!ASSERT_OK(fstat(fd, &st), "fstat /proc/self/exe")) {
++		close(fd);
++		return 1;
++	}
++	beyond_eof_offset = st.st_size + (1ULL << 30);
+ 
+ 	do {
+ 		cur = read(fd, file_contents + n, sizeof(file_contents) - n);
+@@ -75,6 +83,7 @@ static void run_test(const char *prog_name)
+ 
+ 	memcpy(skel->bss->user_buf, file_contents, sizeof(file_contents));
+ 	skel->bss->pid = getpid();
++	skel->bss->beyond_eof_offset = beyond_eof_offset;
+ 
+ 	err = file_reader__load(skel);
+ 	if (!ASSERT_OK(err, "file_reader__load"))
+@@ -110,6 +119,12 @@ void test_file_reader(void)
+ 	if (test__start_subtest("on_open_validate_file_read"))
+ 		run_test("on_open_validate_file_read");
+ 
++	if (test__start_subtest("on_open_non_sleepable_first"))
++		run_test("on_open_non_sleepable_first");
++
++	if (test__start_subtest("on_open_sleepable_first"))
++		run_test("on_open_sleepable_first");
++
+ 	if (test__start_subtest("negative"))
+ 		RUN_TESTS(file_reader_fail);
+ }
+diff --git a/tools/testing/selftests/bpf/progs/file_reader.c b/tools/testing/selftests/bpf/progs/file_reader.c
+index aa2c05cce2b3..8b972fd26d73 100644
+--- a/tools/testing/selftests/bpf/progs/file_reader.c
++++ b/tools/testing/selftests/bpf/progs/file_reader.c
+@@ -27,9 +27,14 @@ char tmp_buf[256000];
+ 
+ int pid = 0;
+ int err, run_success = 0;
++__u64 beyond_eof_offset;
+ 
+ static int validate_file_read(struct file *file);
+ static int task_work_callback(struct bpf_map *map, void *key, void *value);
++static int sleepable_second_callback(struct bpf_map *map, void *key, void *value);
++
++void bpf_rcu_read_lock(void) __ksym;
++void bpf_rcu_read_unlock(void) __ksym;
+ 
+ SEC("lsm/file_open")
+ int on_open_expect_fault(void *c)
+@@ -81,6 +86,101 @@ int on_open_validate_file_read(void *c)
+ 	return 0;
+ }
+ 
++/*
++ * Exercise bpf_dynptr_from_file() first from a non-sleepable LSM program and
++ * then from its sleepable task-work callback. Reading beyond EOF makes the two
++ * backing implementations return different errors.
++ */
++SEC("lsm/file_open")
++int on_open_non_sleepable_first(void *c)
++{
++	struct task_struct *task = bpf_get_current_task_btf();
++	struct bpf_dynptr dynptr;
++	struct elem *work;
++	struct file *file;
++	int key = 0;
++	int ret;
++
++	if (bpf_get_current_pid_tgid() >> 32 != pid)
++		return 0;
++
++	file = bpf_get_task_exe_file(task);
++	if (!file) {
++		err = 1;
++		return 0;
++	}
++
++	/* The non-sleepable reader cannot fault in an uncached folio. */
++	ret = bpf_dynptr_from_file(file, 0, &dynptr);
++	if (!ret)
++		ret = bpf_dynptr_read(tmp_buf, 1, &dynptr, beyond_eof_offset, 0);
++	bpf_dynptr_file_discard(&dynptr);
++	bpf_put_file(file);
++	if (ret != -EFAULT) {
++		err = 2;
++		return 0;
++	}
++
++	work = bpf_map_lookup_elem(&arrmap, &key);
++	if (!work) {
++		err = 3;
++		return 0;
++	}
++
++	ret = bpf_task_work_schedule_signal(task, &work->tw, &arrmap,
++					    sleepable_second_callback);
++	if (ret)
++		err = 4;
++	return 0;
++}
++
++/*
++ * Exercise the opposite fixup order: the first call is made from a sleepable
++ * LSM program, while the RCU read-side section makes the second non-sleepable.
++ */
++SEC("lsm.s/file_open")
++int on_open_sleepable_first(void *c)
++{
++	struct task_struct *task = bpf_get_current_task_btf();
++	struct bpf_dynptr dynptr;
++	struct file *file;
++	int ret;
++
++	if (bpf_get_current_pid_tgid() >> 32 != pid)
++		return 0;
++
++	file = bpf_get_task_exe_file(task);
++	if (!file) {
++		err = 7;
++		return 0;
++	}
++
++	ret = bpf_dynptr_from_file(file, 0, &dynptr);
++	if (!ret)
++		ret = bpf_dynptr_read(tmp_buf, 1, &dynptr, beyond_eof_offset, 0);
++	bpf_dynptr_file_discard(&dynptr);
++	if (ret != -EIO) {
++		err = 8;
++		goto out;
++	}
++
++	bpf_rcu_read_lock();
++	ret = bpf_dynptr_from_file(file, 0, &dynptr);
++	bpf_rcu_read_unlock();
++	if (!ret)
++		ret = bpf_dynptr_read(tmp_buf, 1, &dynptr, beyond_eof_offset, 0);
++	bpf_dynptr_file_discard(&dynptr);
++	if (ret != -EFAULT) {
++		err = 9;
++		goto out;
++	}
++
++	run_success = 1;
++out:
++	bpf_put_file(file);
++	return 0;
++}
++
+ /* Called in a sleepable context, read 256K bytes, cross check with user space read data */
+ static int task_work_callback(struct bpf_map *map, void *key, void *value)
+ {
+@@ -97,6 +197,35 @@ static int task_work_callback(struct bpf_map *map, void *key, void *value)
+ 	return 0;
+ }
+ 
++/* Task-work callbacks are verified as sleepable. */
++static int sleepable_second_callback(struct bpf_map *map, void *key, void *value)
++{
++	struct task_struct *task = bpf_get_current_task_btf();
++	struct bpf_dynptr dynptr;
++	struct file *file;
++	int ret;
++
++	file = bpf_get_task_exe_file(task);
++	if (!file) {
++		err = 5;
++		return 0;
++	}
++
++	/* freader_fetch() converts __kernel_read()'s short read at EOF to -EIO. */
++	ret = bpf_dynptr_from_file(file, 0, &dynptr);
++	if (!ret)
++		ret = bpf_dynptr_read(tmp_buf, 1, &dynptr, beyond_eof_offset, 0);
++	bpf_dynptr_file_discard(&dynptr);
++	bpf_put_file(file);
++	if (ret != -EIO) {
++		err = 6;
++		return 0;
++	}
++
++	run_success = 1;
++	return 0;
++}
++
+ static int verify_dynptr_read(struct bpf_dynptr *ptr, u32 off, char *user_buf, u32 len)
+ {
+ 	int i;
+-- 
+2.52.0
+

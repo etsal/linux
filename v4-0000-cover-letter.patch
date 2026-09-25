@@ -1,0 +1,75 @@
+From d65abfa881481e5aa1a9c9726f3768854b187b3d Mon Sep 17 00:00:00 2001
+From: Emil Tsalapatis <emil@etsalapatis.com>
+Date: Fri, 25 Sep 2026 16:26:53 -0700
+Subject: [PATCH bpf v4 0/7] Make sleepable arena paths use sleepable alloc_pages
+
+The arena_alloc_pages() call takes a sleepable argument based on whether
+its caller is a sleepable BPF function. This flag, along with the context
+the kfunc is called in, decides whether the call will try to fulfill the
+allocation using the regular or the _nolock variant of the alloc_pages
+API, by means of bpf_map_alloc_pages().
+
+However, the arena_alloc_pages() call currently only makes allocations
+inside an IRQ-disabled critical section. This forces all allocations to
+use the _nolock() API, which may eagerly fail where the regular variant
+would eventually succeed. There have been reports of this happening for
+sched-ext schedulers.
+
+Restructure arena_alloc_pages() to use the _nolock() page allocation API
+only when necessary. This requires moving allocations outside of the 
+spinlock critical section for sleepable calls, which in turn requires
+slightly different logic in the allocation path. Replace the page list
+allocation with logic that reuses pcp_llist to chain allocated pages
+together, allowing us to merge the code paths for both sleepable and
+nonsleepable arena allocations.
+
+Also fix kfunc specialization to not unnecessarily force the nonsleepable version
+of bpf_arena_alloc_pages() for call sites that do not need it. This requires
+making specialization per-call site instead of overwriting the descriptor
+during fixups. 
+
+Signed-off-by: Emil Tsalapatis <emil@etsalapatis.com>
+
+v1 -> v2 (https://lore.kernel.org/bpf/20260824082530.47553-1-emil@etsalapatis.com/)
+
+- Keep the sleepable and non-sleepable allocation paths within
+  arena_alloc_pages (Alexei)
+- Incorporate bot feedback on selftests (bot-ci)
+
+v2 -> v3 (https://lore.kernel.org/bpf/20260923191125.5311-1-emil@etsalapatis.com/)
+
+- Remove the intermediate page array allocation in bpf_arena_alloc_pages() and
+  use the pcp_llist pointer instead (Alexei)
+- Fix function specialization to only specialize to the nonsleepable version
+  when necessary
+
+v3 -> v4 (https://lore.kernel.org/bpf/20260925203939.4105-1-emil@etsalapatis.com/)
+
+- Remove in-flight pages tracking (Alexei)
+- Remove stale split sleepable/nonsleepable error handling (Alexei)
+
+
+Emil Tsalapatis (7):
+  bpf: Use an llist for page allocations
+  bpf: Add sleepable argument to bpf_alloc_pages()
+  bpf: Add sleepable arena page allocation path
+  selftests/bpf: Test large allocations for both sleepable/nonsleepable
+    arena users
+  bpf: Support call-site kfunc specialization for near calls
+  bpf: Support call-site kfunc specialization for far calls
+  selftests/bpf: Test per-call site function specialization
+
+ include/linux/bpf.h                           |  10 +-
+ include/linux/bpf_verifier.h                  |  15 +-
+ kernel/bpf/arena.c                            | 158 +++++++++---------
+ kernel/bpf/fixups.c                           |  18 +-
+ kernel/bpf/syscall.c                          |  43 +++--
+ kernel/bpf/verifier.c                         |  82 ++++++++-
+ .../selftests/bpf/prog_tests/file_reader.c    |  15 ++
+ .../testing/selftests/bpf/progs/file_reader.c | 129 ++++++++++++++
+ .../bpf/progs/verifier_arena_large.c          |  64 +++++--
+ 9 files changed, 405 insertions(+), 129 deletions(-)
+
+-- 
+2.52.0
+
