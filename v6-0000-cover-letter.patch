@@ -1,0 +1,31 @@
+From 7ce200ff57f5dc0b8040de9251453802ffdf51e2 Mon Sep 17 00:00:00 2001
+From: Emil Tsalapatis <emil@etsalapatis.com>
+Date: Fri, 2 Oct 2026 01:27:19 -0700
+Subject: [RESEND PATCH bpf-next v6 0/7] *** SUBJECT HERE ***
+
+*** BLURB HERE ***
+
+Emil Tsalapatis (7):
+  bpf: Use an llist for page allocations
+  bpf: Add sleepable argument to bpf_alloc_pages()
+  bpf: Add sleepable arena page allocation path
+  selftests/bpf: Test large allocations for both sleepable/nonsleepable
+    arena users
+  bpf: Directly store kfunc desc index in instruction off field
+  bpf: Support per-call-site kfunc specialization
+  selftests/bpf: Test per-call site function specialization
+
+ include/linux/bpf.h                           |  10 +-
+ include/linux/bpf_verifier.h                  |  15 +-
+ kernel/bpf/arena.c                            | 158 +++++++++---------
+ kernel/bpf/fixups.c                           |  70 +-------
+ kernel/bpf/syscall.c                          |  43 +++--
+ kernel/bpf/verifier.c                         | 107 +++++++++++-
+ .../selftests/bpf/prog_tests/file_reader.c    |  15 ++
+ .../testing/selftests/bpf/progs/file_reader.c | 129 ++++++++++++++
+ .../bpf/progs/verifier_arena_large.c          |  64 +++++--
+ 9 files changed, 423 insertions(+), 188 deletions(-)
+
+-- 
+2.52.0
+

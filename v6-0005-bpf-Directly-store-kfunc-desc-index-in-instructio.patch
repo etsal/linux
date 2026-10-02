@@ -1,0 +1,248 @@
+From f868cf420d0d331d499c832005ee1ad0c050a34f Mon Sep 17 00:00:00 2001
+From: Emil Tsalapatis <emil@etsalapatis.com>
+Date: Mon, 28 Sep 2026 11:20:29 -0700
+Subject: [RESEND PATCH bpf-next v6 5/7] bpf: Directly store kfunc desc index
+ in instruction off field
+
+Currently, the verifier sort the kfunc desc table twice: Once during
+kfunc collection by function ID, useful during verification, and
+once by immediate address, useful during JIT bytecode lowering
+time. The latter sort can be removed by storing in the instruction
+the kfunc desc array index the desc is in and using that instead.
+Modify the JITs to follow the same convention.
+
+This change simplifies the subsequent patch that adds per-call site
+function specialization.
+
+Signed-off-by: Emil Tsalapatis <emil@etsalapatis.com>
+---
+ include/linux/bpf.h          |  4 +--
+ include/linux/bpf_verifier.h |  7 ++--
+ kernel/bpf/fixups.c          | 70 +++++-------------------------------
+ kernel/bpf/verifier.c        | 25 ++++++++++---
+ 4 files changed, 33 insertions(+), 73 deletions(-)
+
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index 670eb9f3f20a..eed7f8f1e417 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -3301,7 +3301,7 @@ const struct btf_func_model *
+ bpf_jit_find_kfunc_model(const struct bpf_prog *prog,
+ 			 const struct bpf_insn *insn);
+ int bpf_get_kfunc_addr(const struct bpf_prog *prog, u32 func_id,
+-		       u16 btf_fd_idx, u8 **func_addr);
++		       u16 desc_idx, u8 **func_addr);
+ 
+ struct bpf_core_ctx {
+ 	struct bpf_verifier_log *log;
+@@ -3644,7 +3644,7 @@ bpf_jit_find_kfunc_model(const struct bpf_prog *prog,
+ 
+ static inline int
+ bpf_get_kfunc_addr(const struct bpf_prog *prog, u32 func_id,
+-		   u16 btf_fd_idx, u8 **func_addr)
++		   u16 desc_idx, u8 **func_addr)
+ {
+ 	return -ENOTSUPP;
+ }
+diff --git a/include/linux/bpf_verifier.h b/include/linux/bpf_verifier.h
+index c775bd757706..5cbae5d05fe7 100644
+--- a/include/linux/bpf_verifier.h
++++ b/include/linux/bpf_verifier.h
+@@ -1784,12 +1784,12 @@ enum bpf_reg_arg_type {
+ };
+ 
+ #define MAX_KFUNC_DESCS 256
++static_assert(MAX_KFUNC_DESCS <= S16_MAX + 1);
+ 
+ struct bpf_kfunc_desc {
+ 	struct btf_func_model func_model;
+ 	struct bpf_func_proto proto;
+ 	u32 func_id;
+-	s32 imm;
+ 	u16 offset;
+ 	unsigned long addr;
+ };
+@@ -1797,9 +1797,8 @@ struct bpf_kfunc_desc {
+ struct bpf_kfunc_desc_tab {
+ 	u32 nr_descs;
+ 	/* Sorted by func_id (BTF ID) and offset (fd_array offset) during
+-	 * verification. JITs do lookups by bpf_insn, where func_id may not be
+-	 * available, therefore at the end of verification do_misc_fixups()
+-	 * sorts this by imm and offset.
++	 * verification. JITs use the descriptor index stored in the finalized
++	 * call's off field.
+ 	 *
+ 	 * Grown one entry at a time by bpf_add_kfunc_call().
+ 	 */
+diff --git a/kernel/bpf/fixups.c b/kernel/bpf/fixups.c
+index 37cf130ebb57..cb7219ff68bd 100644
+--- a/kernel/bpf/fixups.c
++++ b/kernel/bpf/fixups.c
+@@ -5,8 +5,6 @@
+ #include <linux/bpf_verifier.h>
+ #include <linux/filter.h>
+ #include <linux/vmalloc.h>
+-#include <linux/bsearch.h>
+-#include <linux/sort.h>
+ #include <linux/perf_event.h>
+ #include <linux/sched/signal.h>
+ #include <net/xdp.h>
+@@ -117,73 +115,26 @@ int bpf_insn_def32(struct bpf_prog *prog, struct bpf_insn *insn)
+ 	return dst_reg;
+ }
+ 
+-static int kfunc_desc_cmp_by_imm_off(const void *a, const void *b)
+-{
+-	const struct bpf_kfunc_desc *d0 = a;
+-	const struct bpf_kfunc_desc *d1 = b;
+-
+-	if (d0->imm != d1->imm)
+-		return d0->imm < d1->imm ? -1 : 1;
+-	if (d0->offset != d1->offset)
+-		return d0->offset < d1->offset ? -1 : 1;
+-	return 0;
+-}
+-
+ const struct btf_func_model *
+ bpf_jit_find_kfunc_model(const struct bpf_prog *prog,
+ 			 const struct bpf_insn *insn)
+ {
+-	const struct bpf_kfunc_desc desc = {
+-		.imm = insn->imm,
+-		.offset = insn->off,
+-	};
+ 	const struct bpf_kfunc_desc *res;
+ 	struct bpf_kfunc_desc_tab *tab;
+ 
+ 	tab = prog->aux->kfunc_tab;
+-	res = bsearch(&desc, tab->descs, tab->nr_descs,
+-		      sizeof(tab->descs[0]), kfunc_desc_cmp_by_imm_off);
+-
+-	return res ? &res->func_model : NULL;
+-}
+-
+-static int set_kfunc_desc_imm(struct bpf_verifier_env *env, struct bpf_kfunc_desc *desc)
+-{
+-	unsigned long call_imm;
++	if (insn->off < 0 || insn->off >= tab->nr_descs)
++		return NULL;
+ 
++	res = &tab->descs[insn->off];
+ 	if (bpf_jit_supports_far_kfunc_call()) {
+-		call_imm = desc->func_id;
+-	} else {
+-		call_imm = BPF_CALL_IMM(desc->addr);
+-		/* Check whether the relative offset overflows desc->imm */
+-		if ((unsigned long)(s32)call_imm != call_imm) {
+-			verbose(env, "address of kernel func_id %u is out of range\n",
+-				desc->func_id);
+-			return -EINVAL;
+-		}
+-	}
+-	desc->imm = call_imm;
+-	return 0;
+-}
+-
+-static int sort_kfunc_descs_by_imm_off(struct bpf_verifier_env *env)
+-{
+-	struct bpf_kfunc_desc_tab *tab;
+-	int i, err;
+-
+-	tab = env->prog->aux->kfunc_tab;
+-	if (!tab)
+-		return 0;
+-
+-	for (i = 0; i < tab->nr_descs; i++) {
+-		err = set_kfunc_desc_imm(env, &tab->descs[i]);
+-		if (err)
+-			return err;
++		if (res->func_id != insn->imm)
++			return NULL;
++	} else if ((s32)BPF_CALL_IMM(res->addr) != insn->imm) {
++		return NULL;
+ 	}
+ 
+-	sort(tab->descs, tab->nr_descs, sizeof(tab->descs[0]),
+-	     kfunc_desc_cmp_by_imm_off, NULL);
+-	return 0;
++	return &res->func_model;
+ }
+ 
+ static int add_kfunc_in_insns(struct bpf_verifier_env *env,
+@@ -2720,10 +2671,6 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
+ 		}
+ 	}
+ 
+-	ret = sort_kfunc_descs_by_imm_off(env);
+-	if (ret)
+-		return ret;
+-
+ 	return 0;
+ }
+ 
+@@ -2897,4 +2844,3 @@ int bpf_remove_fastcall_spills_fills(struct bpf_verifier_env *env)
+ 
+ 	return 0;
+ }
+-
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 03dbc0e00398..8183a8f22ed5 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -2584,12 +2584,16 @@ find_kfunc_desc(const struct bpf_prog *prog, u32 func_id, u16 offset)
+ }
+ 
+ int bpf_get_kfunc_addr(const struct bpf_prog *prog, u32 func_id,
+-		       u16 btf_fd_idx, u8 **func_addr)
++		       u16 desc_idx, u8 **func_addr)
+ {
++	struct bpf_kfunc_desc_tab *tab;
+ 	const struct bpf_kfunc_desc *desc;
+ 
+-	desc = find_kfunc_desc(prog, func_id, btf_fd_idx);
+-	if (!desc)
++	tab = prog->aux->kfunc_tab;
++	if (desc_idx >= tab->nr_descs)
++		return -EFAULT;
++	desc = &tab->descs[desc_idx];
++	if (desc->func_id != func_id)
+ 		return -EFAULT;
+ 
+ 	*func_addr = (u8 *)desc->addr;
+@@ -22079,6 +22083,8 @@ int bpf_fixup_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
+ 		     struct bpf_insn *insn_buf, int insn_idx, int *cnt)
+ {
+ 	struct bpf_kfunc_desc *desc;
++	unsigned long call_imm;
++	u16 desc_idx;
+ 	int err;
+ 
+ 	if (!insn->imm) {
+@@ -22098,13 +22104,22 @@ int bpf_fixup_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
+ 			     insn->imm);
+ 		return -EFAULT;
+ 	}
++	desc_idx = desc - env->prog->aux->kfunc_tab->descs;
+ 
+ 	err = specialize_kfunc(env, desc, insn_idx);
+ 	if (err)
+ 		return err;
+ 
+-	if (!bpf_jit_supports_far_kfunc_call())
+-		insn->imm = BPF_CALL_IMM(desc->addr);
++	if (!bpf_jit_supports_far_kfunc_call()) {
++		call_imm = BPF_CALL_IMM(desc->addr);
++		if ((unsigned long)(s32)call_imm != call_imm) {
++			verbose(env, "address of kernel func_id %u is out of range\n",
++				desc->func_id);
++			return -EINVAL;
++		}
++		insn->imm = call_imm;
++	}
++	insn->off = desc_idx;
+ 
+ 	if (is_bpf_obj_new_kfunc(desc->func_id) || is_bpf_percpu_obj_new_kfunc(desc->func_id)) {
+ 		struct btf_struct_meta *kptr_struct_meta = env->insn_aux_data[insn_idx].kptr_struct_meta;
+-- 
+2.52.0
+
