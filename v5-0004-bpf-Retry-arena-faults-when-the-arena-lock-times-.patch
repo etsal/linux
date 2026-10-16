@@ -1,0 +1,75 @@
+From 8d26320bb6ac9970f42b24efda888b1e6b6635e9 Mon Sep 17 00:00:00 2001
+From: Emil Tsalapatis <emil@etsalapatis.com>
+Date: Thu, 15 Oct 2026 14:34:09 -0700
+Subject: [PATCH bpf-next v5 4/5] bpf: Retry arena faults when the arena lock
+ times out
+
+arena_vm_fault() and arena_fault_page() raise SIGBUS whenever they
+fail to take the arena spinlock. The resilient spinlock fails with
+-EDEADLK when it detects a deadlock involving locks the caller holds,
+which retrying cannot resolve, and with -ETIMEDOUT otherwise. A
+timeout means either contention or a deadlock among other CPUs that
+the lock broke by timing out. The faulting task holds no other
+resilient spinlock, so it is not part of such a cycle, and a retry
+can succeed. A timeout should not kill the faulting process.
+
+Commit 0b10b945479c ("bpf: Fix mmap_lock deadlock on arena lock
+failure") raised SIGBUS because a retry would have to drop the fault
+lock and bound its retries. Keep SIGBUS for -EDEADLK and retry the
+fault on a timeout. Faults that allow retry drop the fault lock and
+return VM_FAULT_RETRY, as __folio_lock_or_retry() does, unless
+FAULT_FLAG_RETRY_NOWAIT asks to keep it. Each attempt spins until it
+takes the lock or times out, and the fault handlers stop retrying on
+fatal signals, so no explicit bound is needed. Faults that cannot
+retry, such as some get_user_pages() callers, return VM_FAULT_NOPAGE
+so that the caller faults again, as they already do for pages whose
+free is in progress.
+
+Fixes: 0b10b945479c ("bpf: Fix mmap_lock deadlock on arena lock failure")
+Signed-off-by: Emil Tsalapatis <emil@etsalapatis.com>
+---
+ kernel/bpf/arena.c | 14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/kernel/bpf/arena.c b/kernel/bpf/arena.c
+index dd9f322ad57f..034495e014fe 100644
+--- a/kernel/bpf/arena.c
++++ b/kernel/bpf/arena.c
+@@ -589,7 +589,7 @@ static bool arena_fault_page(struct bpf_arena *arena, struct vm_fault *vmf,
+ 
+ 	folio_unlock(folio);
+ 	put_page(page);
+-	if (err) {
++	if (err == -EDEADLK) {
+ 		*retp = VM_FAULT_SIGBUS;
+ 		return true;
+ 	}
+@@ -672,8 +672,13 @@ static vm_fault_t arena_vm_fault(struct vm_fault *vmf)
+ 
+ 	ret = raw_res_spin_lock_irqsave(&arena->spinlock, flags);
+ 	if (ret) {
+-		fault_ret = VM_FAULT_SIGBUS;
+-		goto out_err;
++		/* If we are deadlocking somehow, no way to ensure forward progress. */
++		if (ret == -EDEADLK) {
++			fault_ret = VM_FAULT_SIGBUS;
++			goto out_err;
++		}
++
++		goto retry_free;
+ 	}
+ 
+ 	page = vmalloc_to_page((void *)kaddr);
+@@ -776,6 +781,9 @@ static vm_fault_t arena_vm_fault(struct vm_fault *vmf)
+ 		free_pages_nolock(new_page, 0);
+ 	return fault_ret;
+ 
++retry_free:
++	if (new_page)
++		free_pages_nolock(new_page, 0);
+ retry:
+ 	/* Non-retryable GUP callers recheck the PTE on NOPAGE. */
+ 	if (!(vmf->flags & FAULT_FLAG_ALLOW_RETRY))
+-- 
+2.52.0
+

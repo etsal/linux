@@ -1,0 +1,63 @@
+From 8227fc9ba433b1dbbeb6233deb59f3746b8eab77 Mon Sep 17 00:00:00 2001
+From: Emil Tsalapatis <emil@etsalapatis.com>
+Date: Tue, 13 Oct 2026 12:33:43 -0700
+Subject: [PATCH bpf-next v5 1/5] bpf: Stop deferred arena frees before map
+ teardown
+
+arena_free_worker() requeues itself when acquiring the arena spinlock
+fails. arena_map_free() uses flush_work(), which only waits for the
+queueing instance being flushed. If the worker requeues itself during
+the flush, a later invocation can access the arena after it is freed.
+
+No external callers remain at map teardown. Synchronize the IRQ work
+first, then disable and synchronously cancel the worker. This waits for
+a running callback to finish and prevents it from queueing another
+invocation.
+
+Disabling the work cancels a pending invocation, so free any spans
+still queued. Their pages remain mapped in the kernel arena and are
+freed by the page-table walk that follows.
+
+Fixes: b8467290edab ("bpf: arena: make arena kfuncs any context safe")
+Signed-off-by: Emil Tsalapatis <emil@etsalapatis.com>
+---
+ kernel/bpf/arena.c | 15 +++++++++++++--
+ 1 file changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/kernel/bpf/arena.c b/kernel/bpf/arena.c
+index 0ff707707da0..8857e7b47c6f 100644
+--- a/kernel/bpf/arena.c
++++ b/kernel/bpf/arena.c
+@@ -375,6 +375,8 @@ static int existing_page_cb(pte_t *ptep, unsigned long addr, void *data)
+ static void arena_map_free(struct bpf_map *map)
+ {
+ 	struct bpf_arena *arena = container_of(map, struct bpf_arena, map);
++	struct llist_node *pos, *next;
++	struct arena_free_span *s;
+ 
+ 	/*
+ 	 * Check that user vma-s are not around when bpf map is freed.
+@@ -385,9 +387,18 @@ static void arena_map_free(struct bpf_map *map)
+ 	if (WARN_ON_ONCE(!list_empty(&arena->vma_list)))
+ 		return;
+ 
+-	/* Ensure no pending deferred frees */
++	/*
++	 * No callers remain. Drain the IRQ callback, then stop the worker,
++	 * including any attempts to requeue itself during teardown.
++	 */
+ 	irq_work_sync(&arena->free_irq);
+-	flush_work(&arena->free_work);
++	disable_work_sync(&arena->free_work);
++
++	/* Remaining mapped pages are reclaimed by the page-table walk below. */
++	llist_for_each_safe(pos, next, llist_del_all(&arena->free_spans)) {
++		s = llist_entry(pos, struct arena_free_span, node);
++		kfree_nolock(s);
++	}
+ 
+ 	/*
+ 	 * free_vm_area() calls remove_vm_area() that calls free_unmap_vmap_area().
+-- 
+2.52.0
+
