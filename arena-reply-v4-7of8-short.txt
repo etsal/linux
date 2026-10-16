@@ -1,0 +1,66 @@
+From: Emil Tsalapatis <emil@etsalapatis.com>
+To: Alexei Starovoitov <alexei.starovoitov@gmail.com>, bpf@vger.kernel.org
+Cc: andrii@kernel.org, eddyz87@gmail.com, memxor@gmail.com, daniel@iogearbox.net
+Subject: Re: [PATCH bpf-next v4 7/8] bpf: Synchronize arena page faults with page freeing
+In-Reply-To: <DM5W5YU16482.21ASVI86YUGIR@gmail.com>
+References: <20261014233442.8392-1-emil@etsalapatis.com> <20261014233442.8392-8-emil@etsalapatis.com> <DM5W5YU16482.21ASVI86YUGIR@gmail.com>
+
+On Fri Oct 16, 2026 at 2:02 AM UTC, Alexei Starovoitov wrote:
+> The free path holds nothing when it gets to zap_pages(), so
+> mmap_read_lock() there is fine and patch 1 is not needed.
+
+The free path holds nothing, but the program calling it can. A
+sleepable iter/task_vma program runs with the iterated task's mmap_lock
+held for read, and so does a bpf_find_vma() callback in a sleepable
+program. If either frees pages that this mm maps, zap_pages() takes the
+same mmap_lock again. A writer that queues in between waits for the
+first read lock, and the second one ends up waiting for the writer.
+zap_pages() has to use a trylock.
+
+With a trylock, a free can fail after it has cleared the ptes. It then
+has to defer the zap, and the range stays allocated without ptes until
+the worker is done. In your 0/8 reply you suggested returning the
+scratch_page error for a page that is being freed, so every user fault
+on the range gets SIGBUS for that whole time. If allocating the deferred
+span fails, the pages cannot be freed, because user ptes may still map
+them, and the page table walk in arena_map_free() no longer finds them.
+
+The SIGBUS itself is a problem too. A fault on a page that is being
+freed has never raised a signal. User space cannot tell that a free is
+in progress, and freeing and reallocating is normal arena use.
+
+I have a next version that takes the trylocks before it touches the
+range, and defers before clearing any pte if one fails.
+
+In your 0/8 reply you pointed out that the range tree already shows when
+a page is reserved or being freed. It does, but not which of the two,
+and only a reserved page should fail. A fault could find out by waiting
+for arena->lock, which a free holds while retiring, and checking again.
+But it would have to decide with the fault lock held, so every fault on
+a reserved page would sleep through any free in progress with mmap_lock
+held. Instead, the free records the range it tears down, as one page
+offset and count. It sets the record under arena->spinlock in the same
+section where it calls range_tree_clear() and clears the ptes, and drops
+it when it calls range_tree_set(). Frees are serialized on arena->lock,
+so there is at most one such range, and recording it allocates nothing.
+A fault inside that range waits for the free to finish, and can drop the
+fault lock first. Any other fault on an allocated range without a page
+is on a reserved range and gets the scratch_page error right away, as
+you suggested.
+
+A range without kernel ptes is released right away under
+arena->spinlock, without arena->lock or mmap_lock. buddy_chunk_get()
+frees a reserved range before reallocating it, so its free is never
+deferred in sleepable context. A fault on the range being freed does not
+take arena->lock either, so it cannot make another free fail its
+trylock. It sleeps until the free bumps a counter as it releases the
+range and wakes it with wake_up_var(). That is one counter in struct
+bpf_arena on the shared hashed wait queues, with no reference count and
+no priority between faults and frees. A fault that cannot retry sleeps
+with mmap_lock held, which is safe because a free only trylocks
+mmap_lock and never waits for a waiting fault. Faults elsewhere in the
+arena are not affected. A sleepable free of a populated range is
+deferred only when one of its trylocks fails: while another free, an
+mmap() or munmap() of the arena, or the worker holds arena->lock, or
+while a writer holds or waits for one of the mms' mmap_lock.
+Non-sleepable frees are always deferred, as before. Would that work?
