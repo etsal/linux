@@ -1,0 +1,30 @@
+From: Emil Tsalapatis <emil@etsalapatis.com>
+To: Alexei Starovoitov <alexei.starovoitov@gmail.com>, bpf@vger.kernel.org
+Cc: andrii@kernel.org, eddyz87@gmail.com, memxor@gmail.com, daniel@iogearbox.net
+Subject: Re: [PATCH bpf-next v4 2/8] bpf: Associate arena pages with their mapping
+In-Reply-To: <DM5W5RGVPBAW.2F70WVQ24HT6W@gmail.com>
+References: <20261014233442.8392-1-emil@etsalapatis.com> <20261014233442.8392-3-emil@etsalapatis.com> <DM5W5RGVPBAW.2F70WVQ24HT6W@gmail.com>
+
+On Fri Oct 16, 2026 at 2:02 AM UTC, Alexei Starovoitov wrote:
+> The only place that looks at folio->mapping because of VM_FAULT_LOCKED
+> is PageHWPoison() branch in __do_fault().
+> If that's the reason for this patch then check PageHWPoison() in
+> arena_vm_fault() and return VM_FAULT_HWPOISON.
+> Drop this patch.
+
+Agreed on dropping it, but the check in arena_vm_fault() does not close
+the hole. memory_failure() sets PG_hwpoison before it takes the folio
+lock, so the page can become poisoned after arena_vm_fault() checks it
+and before __do_fault() does. __do_fault() then sees VM_FAULT_LOCKED on
+a poisoned page. If another process that maps the arena already has the
+page mapped, it calls unmap_mapping_folio(), which takes i_mmap_rwsem
+of a NULL mapping.
+
+So the next version doesn't return VM_FAULT_LOCKED. arena_vm_fault()
+locks the page, rechecks vmalloc_to_page() under arena->spinlock, and
+installs the pte itself with finish_fault() before it unlocks the page.
+It checks for poison before finish_fault() and again after it, zapping
+the new pte if the page got poisoned in between. It returns
+VM_FAULT_NOPAGE, so __do_fault() never reaches its poison branch, and no
+page->mapping is needed. As you suggested, the free waits for the page
+lock before zap_pages().

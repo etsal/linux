@@ -1,0 +1,35 @@
+From: Emil Tsalapatis <emil@etsalapatis.com>
+To: Alexei Starovoitov <alexei.starovoitov@gmail.com>, bpf@vger.kernel.org
+Cc: andrii@kernel.org, eddyz87@gmail.com, memxor@gmail.com, daniel@iogearbox.net
+Subject: Re: [PATCH bpf-next v4 6/8] bpf: Fix arena race between page free and alloc leading to incoherency
+In-Reply-To: <DM5W5UNBV54W.LJ1K9VUN2S3S@gmail.com>
+References: <20261014233442.8392-1-emil@etsalapatis.com> <20261014233442.8392-7-emil@etsalapatis.com> <DM5W5UNBV54W.LJ1K9VUN2S3S@gmail.com>
+
+On Fri Oct 16, 2026 at 2:02 AM UTC, Alexei Starovoitov wrote:
+> v3 dropped the span here. v4 puts it back into free_spans and
+> the worker does schedule_work() on itself until kmalloc_nolock()
+> succeeds. It's __GFP_ACCOUNT and it cannot reclaim.
+> At memory.max the arena cannot free its pages, because it cannot
+> allocate a range node, and those pages are charged to the same memcg.
+> The kworker burns cpu in the meantime.
+
+[...]
+
+> The free path shouldn't allocate before the ptes are cleared.
+
+The next version drops the unavailable state, so the free no longer
+allocates a range node before it clears the ptes. range_tree_clear()
+only allocates when the whole range is free, and then there is nothing
+to free, so the free is done. The worker no longer requeues itself
+either. It waits for arena->lock and for a contended mmap_lock instead.
+
+The one allocation left before clearing is the span for a deferred
+free, when a sleepable free fails to trylock arena->lock or one of the
+mmap locks (see my reply to patch 7 for the mmap locks). It uses
+GFP_KERNEL_ACCOUNT | __GFP_RETRY_MAYFAIL, so it can reclaim. If it
+still fails, the free has not touched anything yet. The pages stay
+mapped for both BPF and user space and are freed with the map, as when
+kmalloc_nolock() fails in the non-sleepable path today. Allocating
+after clearing would be worse. The pages could not be freed then,
+because user ptes may still map them and the page table walk in
+arena_map_free() no longer finds them.
