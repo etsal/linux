@@ -1,0 +1,119 @@
+From fdef50545ba6767c81618fa1619d2fbc011f84ae Mon Sep 17 00:00:00 2001
+From: Emil Tsalapatis <emil@etsalapatis.com>
+Date: Fri, 16 Oct 2026 12:02:06 -0700
+Subject: [PATCH bpf-next v5 0/5] bpf: Fix arena memory incoherence
+
+Arena memory is tracked in two places: the range tree, which records
+which addresses are allocated, and the kernel and user page tables. The
+two are updated under different locks, and that leaves two races:
+
+- Since b8467290edab ("bpf: arena: make arena kfuncs any context safe"),
+  a free releases its range before the kernel TLB flush and the user zap
+  complete. A concurrent allocation can then write through stale
+  translations into pages that are about to be freed.
+
+- A user fault takes a reference to the page and installs the user PTE
+  after dropping the arena lock. A free that runs in between leaves user
+  space mapping a page that the arena has already released.
+
+In both cases BPF programs and user space can see different pages at the
+same arena address.
+
+This version fixes both races without adding state to the range tree:
+
+- A free keeps its range allocated until the TLB flush and the user zap
+  are complete, and only then releases it with range_tree_set(). The
+  range being freed is recorded as one page offset and count under
+  arena->spinlock, and user faults on it sleep until the free releases
+  it. Frees serialize on arena->lock, so there is at most one such
+  range, and recording it allocates nothing.
+
+- A user fault pins the page, locks its folio, and revalidates the
+  kernel mapping before installing the user PTE, the way filemap_fault()
+  synchronizes with truncate. The free waits for the folio lock of every
+  page it removed before it zaps user mappings.
+
+Patch 1 fixes a use-after-free at map teardown when the deferred free
+worker requeues itself. Patches 2 and 3 fix the two races. Patch 4
+retries faults when the arena lock times out instead of raising SIGBUS.
+Patch 5 adds selftests.
+
+Signed-off-by: Emil Tsalapatis <emil@etsalapatis.com>
+Cc: Puranjay Mohan <puranjay@kernel.org>
+
+v4 -> v5 (https://lore.kernel.org/bpf/20261014233442.8392-1-emil@etsalapatis.com/)
+
+- Drop the third range-tree state and the is_range_tree_set() change
+  (v4 patches 4 and 5). A free keeps its range allocated until the TLB
+  flush and the user zap complete, then releases it with
+  range_tree_set(). range_tree_clear() only allocates when the whole
+  range is free, and then there is nothing to free. (Alexei)
+- Drop the per-arena mapping, page->mapping, the mapping-tree zap and
+  the new bpf_map_ops callback (v4 patches 1 and 2). (Alexei)
+- Replace opref (v4 patch 7) with the folio lock. A fault rechecks the
+  kernel PTE with the folio locked and installs the user PTE itself with
+  finish_fault(), and a free waits for the folio lock of each page it
+  removed before zapping (new patch 2). (Alexei)
+- Give faults on a reserved range the scratch_page error. Faults on the
+  range being freed sleep until the free releases it, instead of
+  spinning on VM_FAULT_RETRY. (Alexei)
+- Trylock arena->lock and the mmap read lock of every process that maps
+  the arena before retiring a range, and defer the free if one is
+  contended. The worker waits for the contended lock instead of
+  requeueing itself. The deferred span, allocated with
+  __GFP_RETRY_MAYFAIL when the caller can sleep, is the only allocation
+  before the ptes are cleared. (Alexei)
+- Release a range without kernel ptes, such as a reserved one, right
+  away without arena->lock or mmap_lock, so freeing and reallocating a
+  reserved range is never deferred in sleepable context.
+- Retry faults when the arena lock times out, keeping SIGBUS for
+  -EDEADLK (new patch 4).
+- Selftests: rename the subtests, and pause frees in zap_vma_range(),
+  which arm64 can trace, instead of flush_tlb_kernel_range().
+
+v3 -> v4 (https://lore.kernel.org/bpf/20260923191125.5311-1-emil@etsalapatis.com/)
+
+- Add per-arena anonymous mappings and associate pages with them
+- Return VM_FAULT_LOCKED and let generic MM install user PTEs; wait
+  for locked fault pages before TLB flushing and zapping (Alexei).
+- Add mutual exclusion between arena free and fault operations to
+  prevent incoherency.
+- Return VM_FAULT_NOPAGE for non-retryable GUP faults when progress is
+  impossible.
+- Stop and drain self-requeueing deferred frees before map teardown.
+- Track ownership of unavailable ranges independently of free progress
+  and retry worker reservations on -ENOMEM without starting teardown.
+- Make arena free span state machine explicit.
+
+v2 -> v3 (https://lore.kernel.org/bpf/20260923061425.7045-1-emil@etsalapatis.com/)
+
+- Rebase on bpf-next and resolve conflicts
+- Fold in the atomic mark_available range tree operation into initial
+  fix patches
+
+v1 -> v2 (https://lore.kernel.org/bpf/20260902070239.16968-1-emil@etsalapatis.com/)
+
+- Use __range_iter_next() in is_range_tree_set() (bot-ci)
+- Move -EAGAIN handling to the patch where the errno is introduced (bot-ci)
+- Add refactoring patch for (Puranjay)
+- Avoid leaking unavailable range tree nodes with atomic mark_available
+  operation()
+- Avoid retries on res spinlock locking for -EDEADLK (Puranjay)
+
+Emil Tsalapatis (5):
+  bpf: Stop deferred arena frees before map teardown
+  bpf: Revalidate faulted arena pages before installing user mappings
+  bpf: Fix arena race between page free and alloc leading to incoherency
+  bpf: Retry arena faults when the arena lock times out
+  selftests/bpf: Add arena allocation race tests
+
+ kernel/bpf/arena.c                            | 702 +++++++++++++-----
+ .../selftests/bpf/prog_tests/arena_race.c     | 291 ++++++++
+ .../testing/selftests/bpf/progs/arena_race.c  | 166 +++++
+ 3 files changed, 964 insertions(+), 195 deletions(-)
+ create mode 100644 tools/testing/selftests/bpf/prog_tests/arena_race.c
+ create mode 100644 tools/testing/selftests/bpf/progs/arena_race.c
+
+-- 
+2.52.0
+
