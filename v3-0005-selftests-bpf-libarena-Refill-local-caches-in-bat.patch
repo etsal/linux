@@ -1,0 +1,104 @@
+From ee8aedb50cdb132b534da9d5cab218615dfe4463 Mon Sep 17 00:00:00 2001
+From: Emil Tsalapatis <emil@etsalapatis.com>
+Date: Wed, 21 Oct 2026 23:26:39 +0000
+Subject: [PATCH bpf-next v3 5/7] selftests/bpf: libarena: Refill local caches
+ in batches
+
+Cache hits avoid the central lock, but every cache miss still asks the
+buddy allocator for one object. A sequence of misses therefore repeats
+the same locking and metadata work.
+
+Allocate eight objects with buddy_alloc_bulk() on a local-cache miss.
+Return one object directly and retain the other seven in the per-CPU LIFO
+array. This amortizes buddy locking and metadata updates over subsequent
+allocations. Skip the refill in NMI context, where the backend allocator
+cannot safely take its lock.
+
+Express the array capacity as twice the batch size, so that a refilled
+array can still absorb a full batch of frees before it overflows.
+
+Signed-off-by: Emil Tsalapatis <emil@etsalapatis.com>
+---
+ .../bpf/libarena/include/libarena/buddy.h     |  6 +++-
+ .../selftests/bpf/libarena/src/buddy.bpf.c    | 28 +++++++++++++++++--
+ 2 files changed, 30 insertions(+), 4 deletions(-)
+
+diff --git a/tools/testing/selftests/bpf/libarena/include/libarena/buddy.h b/tools/testing/selftests/bpf/libarena/include/libarena/buddy.h
+index de8d29ea4673..0c984952042a 100644
+--- a/tools/testing/selftests/bpf/libarena/include/libarena/buddy.h
++++ b/tools/testing/selftests/bpf/libarena/include/libarena/buddy.h
+@@ -81,10 +81,14 @@ enum buddy_cache_consts {
+ 	 */
+ 	BUDDY_CACHE_MAX_CPUS = 1024,
+ 
++	/* Objects moved to and from the buddy allocator at once, as an order. */
++	BUDDY_CACHE_BATCH_ORDER = 3,
++	BUDDY_CACHE_BATCH_SIZE = 1 << BUDDY_CACHE_BATCH_ORDER,
++
+ 	/*
+ 	 * Objects retained locally for each allocation order.
+ 	 */
+-	BUDDY_CACHE_CAPACITY = 16,
++	BUDDY_CACHE_CAPACITY = BUDDY_CACHE_BATCH_SIZE * 2,
+ };
+ 
+ struct buddy_cache_order {
+diff --git a/tools/testing/selftests/bpf/libarena/src/buddy.bpf.c b/tools/testing/selftests/bpf/libarena/src/buddy.bpf.c
+index 6f98044518ed..837d5cf70185 100644
+--- a/tools/testing/selftests/bpf/libarena/src/buddy.bpf.c
++++ b/tools/testing/selftests/bpf/libarena/src/buddy.bpf.c
+@@ -131,10 +131,28 @@ static __always_inline int buddy_cache_push(struct buddy_cache __arena *cache,
+ 	return 0;
+ }
+ 
+-void __arena *buddy_cache_alloc(struct buddy __arena *buddy, size_t order)
++/*
++ * Refill an empty cache with one trip to the buddy allocator. Kept out of line
++ * so that cache hits do not pay for the refill path.
++ */
++static __noinline void __arena *
++buddy_cache_refill(struct buddy __arena *buddy, struct buddy_cache __arena *cache,
++		   size_t size, int order)
++{
++	struct buddy_cache_order __arena *slots = &cache->orders[order];
++
++	if (buddy_alloc_bulk(buddy, size, BUDDY_CACHE_BATCH_ORDER,
++			     (void __arena * __arena *)slots->objects))
++		return NULL;
++
++	WRITE_ONCE(slots->elems, BUDDY_CACHE_BATCH_SIZE - 1);
++	return slots->objects[BUDDY_CACHE_BATCH_SIZE - 1];
++}
++
++void __arena *buddy_cache_alloc(struct buddy __arena *buddy, size_t size, size_t order)
+ {
+ 	struct buddy_cache __arena *cache;
+-	void __arena *address = NULL;
++	void __arena *address;
+ 
+ 	if (!buddy_order_cached(order))
+ 		return NULL;
+@@ -143,7 +161,11 @@ void __arena *buddy_cache_alloc(struct buddy __arena *buddy, size_t order)
+ 	if (!cache)
+ 		return NULL;
+ 
++	/* NMIs cannot take the buddy lock, so they only use what is already cached. */
+ 	address = buddy_cache_pop(cache, order);
++	if (!address && !bpf_in_nmi())
++		address = buddy_cache_refill(buddy, cache, size, order);
++
+ 	buddy_cache_exit(cache);
+ 
+ 	return address;
+@@ -1060,7 +1082,7 @@ void __arena *buddy_alloc(struct buddy __arena *buddy, size_t size)
+ 		return NULL;
+ 
+ 	order = size_to_order(size);
+-	address = buddy_cache_alloc(buddy, order);
++	address = buddy_cache_alloc(buddy, size, order);
+ 	if (address)
+ 		return address;
+ 
+-- 
+2.52.0
+

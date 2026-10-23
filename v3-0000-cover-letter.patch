@@ -1,0 +1,123 @@
+From de1a04f1e2f761dcc043302c7ddbfdd92bae6b3f Mon Sep 17 00:00:00 2001
+From: Emil Tsalapatis <emil@etsalapatis.com>
+Date: Thu, 22 Oct 2026 16:30:48 -0700
+Subject: [PATCH bpf-next v3 0/7] bpf libarena allocator improvements
+
+The libarena buddy allocator's design has up until now prioritized
+ease of verification. With new verifier features like unlimited
+global stack frames and a large stack size we can now improve
+the allocator's performance and robustness.
+
+This patch introduces per-CPU caches for the allocator. The overall
+caching design is inspired by tcmalloc. Each CPU has its own static
+object LIFOs, one for each allocator order. This speeds up allocation
+and freeing for BPF programs that have some degree of locality. The
+CPU caches are lockless. The caches are replenished from and spilled
+into "transfer caches", per-order caches shared between the CPUs that
+amortize the cost of spilling/refilling. Data from the transfer caches
+is in turn moved from and to the allocator.
+
+The patchset additionally includes code for allocator reentrancy and
+bulk allocations. The reentrancy code lets us safely allocate from an
+NMI context in general, and from a BPF syscall program context
+locklessly. The bulk allocation API is useful for replenishing the
+allocator caches and also on its own right for speeding up allocations
+during initialization.
+
+Benchmark results from patch 2, run with the options from
+run_bench_libarena.sh (-a, 64-byte allocations) in a 16-vCPU VM, as the
+mean of three runs. Rows are the number of consecutive allocations, and
+then frees, in each benchmark iteration. Columns are the number of
+producers. Each entry shows the latency in ns before and with this
+series, followed by the speedup: the latency before divided by the
+latency with this series, so higher is better.
+
+libarena-malloc-free, where each worker frees its own objects:
+
+Allocation latency (before/after ns, speedup):
+
+allocs         1 prod         2 prod         4 prod         8 prod
+     1    269/68 3.9x    641/68 9.4x  1568/68 22.9x  4550/69 66.4x
+     4    251/63 4.0x    557/63 8.9x  2326/67 34.5x  5221/74 70.4x
+    16    247/61 4.0x  1027/64 16.0x  2570/67 38.1x  5315/74 71.8x
+    64    242/75 3.2x  1129/146 7.8x 2469/190 13.0x 5521/374 14.8x
+   256   242/102 2.4x  1314/184 7.1x 2664/249 10.7x 5542/457 12.1x
+
+Free latency (before/after ns, speedup):
+
+allocs         1 prod         2 prod         4 prod         8 prod
+     1    243/55 4.4x    273/56 4.9x  1428/55 25.9x  4371/56 78.2x
+     4    242/51 4.7x    414/52 8.0x  2303/52 44.5x 5266/51 103.1x
+    16    241/50 4.8x  1056/50 20.9x  2580/50 51.6x 5330/51 105.4x
+    64    240/64 3.8x  1079/86 12.5x 2454/131 18.8x 5538/309 17.9x
+   256   238/124 1.9x 1206/107 11.2x 2681/178 15.0x 5546/406 13.7x
+
+libarena-malloc-xfree, where each worker frees the objects allocated by
+the previous invocation, so with more than one producer most frees
+happen on a different CPU from the allocation:
+
+Allocation latency (before/after ns, speedup):
+
+allocs         1 prod         2 prod         4 prod         8 prod
+     1    291/65 4.5x   857/65 13.2x  1165/67 17.5x  4172/70 59.8x
+     4    243/63 3.9x   754/64 11.7x  2170/66 32.6x  4931/79 62.2x
+    16    231/61 3.8x  1163/63 18.5x  2572/71 36.2x  5438/93 58.7x
+    64    229/75 3.1x  1249/158 7.9x 2824/213 13.3x 5760/411 14.0x
+   256   228/100 2.3x  1269/210 6.0x 2746/264 10.4x 5669/466 12.2x
+
+Free latency (before/after ns, speedup):
+
+allocs         1 prod         2 prod         4 prod         8 prod
+     1    266/55 4.8x   558/56 10.0x  1052/56 18.8x  4050/56 72.3x
+     4    231/51 4.5x   583/52 11.2x  2032/51 39.6x  4875/52 93.9x
+    16    223/50 4.5x  1019/50 20.3x  2492/50 49.6x 5396/51 106.5x
+    64    222/63 3.5x  1156/84 13.8x 2801/122 23.0x 5735/320 17.9x
+   256   221/124 1.8x 1202/113 10.7x 2736/160 17.1x 5656/387 14.6x
+
+Cc: Harry Yoo <harry@kernel.org>
+Cc: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Signed-off-by: Emil Tsalapatis <emil@etsalapatis.com>
+
+v2 -> v3 (https://lore.kernel.org/bpf/20261021232641.10063-1-emil@etsalapatis.com/)
+
+- Release the per-CPU cache claim with barrier() and WRITE_ONCE()
+  instead of smp_store_release(), since only contexts on the same CPU
+  claim the cache (Harry).
+
+v1 -> v2 (https://lore.kernel.org/bpf/20261020181900.6755-1-emil@etsalapatis.com/)
+
+- In the transfer cache, avoid taking two locks per free when it is full:
+  check the transfer array's count before taking its lock, and spill the
+  local batch with buddy_free_bulk() when the array is full or busy
+  (Alexei).
+- Simplify the per-CPU caches: keep the guard in struct buddy_cache,
+  claim the cache once per miss or full cache with the refill and spill
+  paths out of line, keep the cache state in struct buddy, and move the
+  definitions into buddy.h (Alexei).
+- Make buddy_free_bulk() fail only when nothing was freed (Alexei).
+- Time frees in the benchmark, add a cross-CPU variant, and add before
+  and after numbers to the cover letter (Alexei).
+- Addressed bot feedback.
+
+Emil Tsalapatis (7):
+  selftests/bpf: libarena: Add bulk buddy allocation helpers
+  selftests/bpf: Add a parallel buddy allocator benchmark
+  selftests/bpf: libarena: Add buddy per-CPU caches
+  selftests/bpf: libarena: Handle NMI reentrancy
+  selftests/bpf: libarena: Refill local caches in batches
+  selftests/bpf: libarena: Add a transfer cache
+  selftests/bpf: libarena: Cover buddy cache fast paths
+
+ tools/testing/selftests/bpf/bench.c           |   4 +
+ .../selftests/bpf/benchs/bench_libarena.c     | 118 +++-
+ .../bpf/benchs/run_bench_libarena.sh          |  16 +
+ .../bpf/libarena/benchs/bench_malloc.bpf.c    | 110 +++
+ .../bpf/libarena/include/libarena/buddy.h     |  56 ++
+ .../bpf/libarena/include/libarena/common.h    |   4 +
+ .../bpf/libarena/selftests/test_buddy.bpf.c   | 273 ++++++++
+ .../selftests/bpf/libarena/src/buddy.bpf.c    | 635 +++++++++++++++++-
+ 8 files changed, 1171 insertions(+), 45 deletions(-)
+
+-- 
+2.52.0
+
