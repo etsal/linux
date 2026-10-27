@@ -1,0 +1,50 @@
+From f360a90a1114eff9dbddd50e657c72189ee83a06 Mon Sep 17 00:00:00 2001
+From: Emil Tsalapatis <emil@etsalapatis.com>
+Date: Tue, 27 Oct 2026 11:44:53 -0700
+Subject: [PATCH bpf-next v2 0/4] selftests/bpf: libarena: compatibility fixups
+
+This patchset fixes several issues found while integrating with large
+BPF codebases.
+
+Patch 1 fixes a mismatch between the in-code licenses for some files
+that do not actually correspond to the licenses at the top of the file.
+Remove the in-code license sections, since libarena is distributed only
+as source code anyway.
+
+Patches 2-3 add an explicit allocator growth call. Some allocator
+users prefer to explicitly expand the arena instead of implicitly
+letting the allocator do so when required to satisfy an alloc. The
+change is non-functional for existing users.
+
+Patch 4 changes the type of the volatile zero variable used for loop
+convergence to __u32. This is available from <linux/types.h>, while u32
+needs to be typedef'ed in for userspace programs.
+
+Signed-off-by: Emil Tsalapatis <emil@etsalapatis.com>
+
+v1 -> v2 (https://lore.kernel.org/bpf/20261027162916.10996-1-emil@etsalapatis.com/)
+- Add a "Dual BSD/GPL" license section to the benchmark consumer so
+  libarena-malloc and libarena-calloc remain loadable (Sashiko bot).
+- Rename buddy_grow()'s size argument to nr_chunks and use a size_t
+  loop index to make the chunk-count API explicit (Sashiko bot).
+
+
+
+Emil Tsalapatis (4):
+  libarena: remove in-code licenses
+  selftests/bpf: libarena: make allocator growth on alloc failure
+    optional
+  selftests/bpf: libarena: add explicit buddy_grow() call
+  selftests/bpf: libarena: Make zero variable type __u32 instead of u32
+
+ .../bpf/libarena/benchs/bench_malloc.bpf.c    |  2 +
+ .../bpf/libarena/include/libarena/buddy.h     |  2 +
+ .../bpf/libarena/include/libarena/common.h    |  2 +-
+ .../selftests/bpf/libarena/src/asan.bpf.c     |  2 -
+ .../selftests/bpf/libarena/src/buddy.bpf.c    | 48 +++++++++++++++++--
+ .../selftests/bpf/libarena/src/common.bpf.c   |  4 +-
+ 6 files changed, 50 insertions(+), 10 deletions(-)
+
+-- 
+2.52.0
+

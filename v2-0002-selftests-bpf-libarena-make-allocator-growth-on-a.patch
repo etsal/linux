@@ -1,0 +1,82 @@
+From 4b6aec433ade5f8db55cc1efa5bf391aec247dcc Mon Sep 17 00:00:00 2001
+From: Emil Tsalapatis <emil@etsalapatis.com>
+Date: Fri, 23 Oct 2026 17:15:53 -0700
+Subject: [PATCH bpf-next v2 2/4] selftests/bpf: libarena: make allocator
+ growth on alloc failure optional
+
+The buddy allocator currently always grows when an allocation fails due
+to a lack of allocated arena pages. This behavior assumes that the user
+sizes the arena to be as large as the maximum allocation size, but that
+is not always the case.
+
+Add a nogrow allocation option for users that want to explicitly control
+the total mapped size of the arena. With this API, an allocation request
+that cannot be serviced from currently mapped arena pages fails instead
+of triggering bpf_arena_alloc_pages(). The user instead explicitly maps
+additional memory into the arena with a separate buddy_grow() call.
+
+Signed-off-by: Emil Tsalapatis <emil@etsalapatis.com>
+---
+ .../bpf/libarena/include/libarena/buddy.h     |  1 +
+ .../selftests/bpf/libarena/src/buddy.bpf.c    | 20 +++++++++++++++++--
+ 2 files changed, 19 insertions(+), 2 deletions(-)
+
+diff --git a/tools/testing/selftests/bpf/libarena/include/libarena/buddy.h b/tools/testing/selftests/bpf/libarena/include/libarena/buddy.h
+index 528c69a1f38e..958450fc5f9d 100644
+--- a/tools/testing/selftests/bpf/libarena/include/libarena/buddy.h
++++ b/tools/testing/selftests/bpf/libarena/include/libarena/buddy.h
+@@ -77,5 +77,6 @@ int buddy_init(struct buddy __arena *buddy);
+ int buddy_destroy(struct buddy __arena *buddy);
+ int buddy_free(struct buddy __arena *buddy, void __arena *free);
+ void __arena *buddy_alloc(struct buddy __arena *buddy, size_t size);
++void __arena *buddy_alloc_nogrow(struct buddy __arena *buddy, size_t size);
+ 
+ #endif /* __BPF__  */
+diff --git a/tools/testing/selftests/bpf/libarena/src/buddy.bpf.c b/tools/testing/selftests/bpf/libarena/src/buddy.bpf.c
+index 552ce87875e3..ed359d4af1f4 100644
+--- a/tools/testing/selftests/bpf/libarena/src/buddy.bpf.c
++++ b/tools/testing/selftests/bpf/libarena/src/buddy.bpf.c
+@@ -747,8 +747,9 @@ static u64 buddy_alloc_from_new_chunk(struct buddy __arena *buddy, struct buddy_
+ 
+ 	return (u64)address;
+ }
+-__weak
+-void __arena *buddy_alloc(struct buddy __arena *buddy, size_t size)
++
++static __always_inline
++void __arena *buddy_alloc_maygrow(struct buddy __arena *buddy, size_t size, bool grow)
+ {
+ 	void __arena *address = NULL;
+ 	struct buddy_chunk __arena *chunk;
+@@ -772,6 +773,9 @@ void __arena *buddy_alloc(struct buddy __arena *buddy, size_t size)
+ 	if (address)
+ 		goto done;
+ 
++	if (!grow)
++		return NULL;
++
+ 	/* Get a new chunk. */
+ 	chunk = buddy_chunk_get(buddy);
+ 	if (chunk)
+@@ -796,6 +800,18 @@ void __arena *buddy_alloc(struct buddy __arena *buddy, size_t size)
+ 	return address;
+ }
+ 
++__weak
++void __arena *buddy_alloc(struct buddy __arena *buddy, size_t size)
++{
++	return buddy_alloc_maygrow(buddy, size, true);
++}
++
++__weak
++void __arena *buddy_alloc_nogrow(struct buddy __arena *buddy, size_t size)
++{
++	return buddy_alloc_maygrow(buddy, size, false);
++}
++
+ static __always_inline int buddy_free_unlocked(struct buddy __arena *buddy, u64 addr)
+ {
+ 	struct buddy_header __arena *header, *buddy_header;
+-- 
+2.52.0
+

@@ -1,0 +1,63 @@
+From ef039a77b762ed31944ff08ba12c79c8359c2658 Mon Sep 17 00:00:00 2001
+From: Emil Tsalapatis <emil@etsalapatis.com>
+Date: Fri, 23 Oct 2026 17:16:28 -0700
+Subject: [PATCH bpf-next v2 1/4] libarena: remove in-code licenses
+
+The libarena code currently specifies a license section in multiple
+locations. These sections are a) inaccurate, since the license is
+actually Dual BSD/GPL, not pure GPL, and b) superfluous, since the
+files already have the license on them and libarena is distributed
+as a source. Remove the license strings: The code that includes the
+the libarena sources should be the one with the license section.
+
+Signed-off-by: Emil Tsalapatis <emil@etsalapatis.com>
+---
+ tools/testing/selftests/bpf/libarena/benchs/bench_malloc.bpf.c | 2 ++
+ tools/testing/selftests/bpf/libarena/src/asan.bpf.c            | 2 --
+ tools/testing/selftests/bpf/libarena/src/buddy.bpf.c           | 2 --
+ tools/testing/selftests/bpf/libarena/src/common.bpf.c          | 2 --
+ 4 files changed, 2 insertions(+), 6 deletions(-)
+
+diff --git a/tools/testing/selftests/bpf/libarena/benchs/bench_malloc.bpf.c b/tools/testing/selftests/bpf/libarena/benchs/bench_malloc.bpf.c
+index e06397dc9a40..636178f1fa6a 100644
+--- a/tools/testing/selftests/bpf/libarena/benchs/bench_malloc.bpf.c
++++ b/tools/testing/selftests/bpf/libarena/benchs/bench_malloc.bpf.c
+@@ -49,3 +49,5 @@ int bench_calloc(void)
+ 	__sync_add_and_fetch(&bench_hits, i);
+ 	return 0;
+ }
++
++char _license[] SEC("license") = "Dual BSD/GPL";
+diff --git a/tools/testing/selftests/bpf/libarena/src/asan.bpf.c b/tools/testing/selftests/bpf/libarena/src/asan.bpf.c
+index de656b69d13a..8a0f06110606 100644
+--- a/tools/testing/selftests/bpf/libarena/src/asan.bpf.c
++++ b/tools/testing/selftests/bpf/libarena/src/asan.bpf.c
+@@ -532,5 +532,3 @@ __weak __noasan int asan_init(struct asan_init_args *args)
+ #pragma clang attribute pop
+ 
+ #endif /* BPF_ARENA_ASAN */
+-
+-__weak char _license[] SEC("license") = "GPL";
+diff --git a/tools/testing/selftests/bpf/libarena/src/buddy.bpf.c b/tools/testing/selftests/bpf/libarena/src/buddy.bpf.c
+index 2490ab1396de..552ce87875e3 100644
+--- a/tools/testing/selftests/bpf/libarena/src/buddy.bpf.c
++++ b/tools/testing/selftests/bpf/libarena/src/buddy.bpf.c
+@@ -899,5 +899,3 @@ __weak int buddy_free(struct buddy __arena *buddy, void __arena *addr)
+ 
+ 	return ret;
+ }
+-
+-__weak char _license[] SEC("license") = "GPL";
+diff --git a/tools/testing/selftests/bpf/libarena/src/common.bpf.c b/tools/testing/selftests/bpf/libarena/src/common.bpf.c
+index d1af60b81838..d859bd538c52 100644
+--- a/tools/testing/selftests/bpf/libarena/src/common.bpf.c
++++ b/tools/testing/selftests/bpf/libarena/src/common.bpf.c
+@@ -85,5 +85,3 @@ __weak void arena_free(void __arena *ptr)
+ {
+ 	buddy_free(&buddy, ptr);
+ }
+-
+-char _license[] SEC("license") = "GPL";
+-- 
+2.52.0
+

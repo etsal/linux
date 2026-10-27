@@ -1,0 +1,67 @@
+From 5c85a3cd103a86434e2195dadaaaa10ac615efab Mon Sep 17 00:00:00 2001
+From: Emil Tsalapatis <emil@etsalapatis.com>
+Date: Mon, 26 Oct 2026 09:45:58 -0700
+Subject: [PATCH bpf-next v2 3/4] selftests/bpf: libarena: add explicit
+ buddy_grow() call
+
+Add an API call for explicitly growing the arena through
+page allocation. Useful for programs that do not do so
+implicitly through buddy_alloc().
+
+Signed-off-by: Emil Tsalapatis <emil@etsalapatis.com>
+---
+ .../bpf/libarena/include/libarena/buddy.h     |  1 +
+ .../selftests/bpf/libarena/src/buddy.bpf.c    | 26 +++++++++++++++++++
+ 2 files changed, 27 insertions(+)
+
+diff --git a/tools/testing/selftests/bpf/libarena/include/libarena/buddy.h b/tools/testing/selftests/bpf/libarena/include/libarena/buddy.h
+index 958450fc5f9d..90674ac077df 100644
+--- a/tools/testing/selftests/bpf/libarena/include/libarena/buddy.h
++++ b/tools/testing/selftests/bpf/libarena/include/libarena/buddy.h
+@@ -78,5 +78,6 @@ int buddy_destroy(struct buddy __arena *buddy);
+ int buddy_free(struct buddy __arena *buddy, void __arena *free);
+ void __arena *buddy_alloc(struct buddy __arena *buddy, size_t size);
+ void __arena *buddy_alloc_nogrow(struct buddy __arena *buddy, size_t size);
++int buddy_grow(struct buddy __arena *buddy, size_t nr_chunks);
+ 
+ #endif /* __BPF__  */
+diff --git a/tools/testing/selftests/bpf/libarena/src/buddy.bpf.c b/tools/testing/selftests/bpf/libarena/src/buddy.bpf.c
+index ed359d4af1f4..d12c8924a0ad 100644
+--- a/tools/testing/selftests/bpf/libarena/src/buddy.bpf.c
++++ b/tools/testing/selftests/bpf/libarena/src/buddy.bpf.c
+@@ -812,6 +812,32 @@ void __arena *buddy_alloc_nogrow(struct buddy __arena *buddy, size_t size)
+ 	return buddy_alloc_maygrow(buddy, size, false);
+ }
+ 
++__weak
++int buddy_grow(struct buddy __arena *buddy, size_t nr_chunks)
++{
++	struct buddy_chunk __arena *chunk;
++	unsigned long flags;
++	size_t chunk_index;
++
++	for (chunk_index = zero; chunk_index < nr_chunks && can_loop; chunk_index++) {
++		chunk = buddy_chunk_get(buddy);
++		if (!chunk)
++			return -ENOMEM;
++
++		if (buddy_lock(buddy, flags)) {
++			bpf_arena_free_pages(&arena, chunk, BUDDY_CHUNK_PAGES);
++			return -ENOMEM;
++		}
++
++		chunk->next = buddy->first_chunk;
++		buddy->first_chunk = chunk;
++
++		buddy_unlock(buddy, flags);
++	}
++
++	return 0;
++}
++
+ static __always_inline int buddy_free_unlocked(struct buddy __arena *buddy, u64 addr)
+ {
+ 	struct buddy_header __arena *header, *buddy_header;
+-- 
+2.52.0
+

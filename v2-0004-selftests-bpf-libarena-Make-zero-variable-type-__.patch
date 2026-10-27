@@ -1,0 +1,45 @@
+From f360a90a1114eff9dbddd50e657c72189ee83a06 Mon Sep 17 00:00:00 2001
+From: Emil Tsalapatis <emil@etsalapatis.com>
+Date: Mon, 26 Oct 2026 09:57:29 -0700
+Subject: [PATCH bpf-next v2 4/4] selftests/bpf: libarena: Make zero variable
+ type __u32 instead of u32
+
+Change the zero variable used for loop convergence to the user-visible
+__u32 type to avoid missing type issues when including the skeleton
+in userspace.
+
+Signed-off-by: Emil Tsalapatis <emil@etsalapatis.com>
+---
+ tools/testing/selftests/bpf/libarena/include/libarena/common.h | 2 +-
+ tools/testing/selftests/bpf/libarena/src/common.bpf.c          | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/tools/testing/selftests/bpf/libarena/include/libarena/common.h b/tools/testing/selftests/bpf/libarena/include/libarena/common.h
+index a6220355a697..940e82cc2928 100644
+--- a/tools/testing/selftests/bpf/libarena/include/libarena/common.h
++++ b/tools/testing/selftests/bpf/libarena/include/libarena/common.h
+@@ -43,7 +43,7 @@ struct {
+  * imprecise. To force the variable to be imprecise, initialize it with
+  * the opaque volatile variable 0 instead of the constant 0.
+  */
+-volatile u32 zero __weak;
++volatile __u32 zero __weak;
+ extern volatile u64 asan_violated;
+ 
+ int arena_fls(__u64 word);
+diff --git a/tools/testing/selftests/bpf/libarena/src/common.bpf.c b/tools/testing/selftests/bpf/libarena/src/common.bpf.c
+index d859bd538c52..c3c5326d8ca2 100644
+--- a/tools/testing/selftests/bpf/libarena/src/common.bpf.c
++++ b/tools/testing/selftests/bpf/libarena/src/common.bpf.c
+@@ -7,7 +7,7 @@
+ #include <libarena/buddy.h>
+ 
+ struct buddy __arena buddy;
+-volatile u32 zero = 0;
++volatile __u32 zero = 0;
+ 
+ /*
+  * Storage for the queue nodes declared by bpf_arena_spin_lock.h. Each program
+-- 
+2.52.0
+
