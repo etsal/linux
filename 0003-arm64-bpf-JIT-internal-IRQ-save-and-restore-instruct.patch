@@ -1,0 +1,108 @@
+From 24258da54c56b7677c075299356630b59885abef Mon Sep 17 00:00:00 2001
+From: Emil Tsalapatis <emil@etsalapatis.com>
+Date: Fri, 23 Oct 2026 13:45:28 -0700
+Subject: [PATCH bpf-next 3/7] arm64, bpf: JIT internal IRQ save and restore
+ instructions
+
+Implement the internal IRQ save/restore instruction in the arm64 JIT,
+using the encoded destination register as the flags pointer.
+
+Support both DAIF masking and GIC priority masking. Preserve the existing
+priority-mask synchronization requirements when restoring interrupt
+state, and decline inlining when IRQ tracing or priority-mask debugging
+is enabled.
+
+Signed-off-by: Emil Tsalapatis <emil@etsalapatis.com>
+---
+ arch/arm64/net/bpf_jit.h      |  8 ++++++++
+ arch/arm64/net/bpf_jit_comp.c | 34 ++++++++++++++++++++++++++++++++++
+ 2 files changed, 42 insertions(+)
+
+diff --git a/arch/arm64/net/bpf_jit.h b/arch/arm64/net/bpf_jit.h
+index b2fe6e6dcf44..23cbc38510a0 100644
+--- a/arch/arm64/net/bpf_jit.h
++++ b/arch/arm64/net/bpf_jit.h
+@@ -8,6 +8,7 @@
+ #define _BPF_JIT_H
+ 
+ #include <asm/insn.h>
++#include <asm/sysreg.h>
+ 
+ /* 5-bit Register Operand */
+ #define A64_R(x)	AARCH64_INSN_REG_##x
+@@ -338,6 +339,13 @@
+ #define A64_MRS_SP_EL0(Rt) \
+ 	aarch64_insn_gen_mrs(Rt, AARCH64_INSN_SYSREG_SP_EL0)
+ 
++#define A64_MRS_SYSREG(Rt, SysReg) \
++	(aarch64_insn_get_mrs_value() | (SysReg) | (Rt))
++#define A64_MSR_SYSREG(Rt, SysReg) \
++	(aarch64_insn_get_msr_reg_value() | (SysReg) | (Rt))
++#define A64_MSR_DAIFSET(Imm) \
++	(aarch64_insn_get_msr_imm_value() | pstate_field(3, 6) | ((Imm) << PSTATE_Imm_shift))
++
+ /* Barriers */
+ #define A64_SB aarch64_insn_get_sb_value()
+ #define A64_DSB_NSH (aarch64_insn_get_dsb_base_value() | 0x7 << 8)
+diff --git a/arch/arm64/net/bpf_jit_comp.c b/arch/arm64/net/bpf_jit_comp.c
+index 326e9e1dea0a..b7f4e4b68e9d 100644
+--- a/arch/arm64/net/bpf_jit_comp.c
++++ b/arch/arm64/net/bpf_jit_comp.c
+@@ -22,6 +22,7 @@
+ #include <asm/cpufeature.h>
+ #include <asm/debug-monitors.h>
+ #include <asm/insn.h>
++#include <asm/irqflags.h>
+ #include <asm/text-patching.h>
+ 
+ #include "bpf_jit.h"
+@@ -2031,6 +2032,33 @@ static int build_insn(const struct bpf_verifier_env *env, const struct bpf_insn
+ 		}
+ 		break;
+ 
++	case BPF_ST | BPF_IRQ:
++	{
++		bool pmr = system_uses_irq_prio_masking();
++		u32 sysreg = pmr ? SYS_ICC_PMR_EL1 : sys_reg(3, 3, 4, 2, 1);
++
++		if (imm == BPF_IRQ_SAVE) {
++			emit(A64_MRS_SYSREG(tmp, sysreg), ctx);
++			if (pmr) {
++				emit(A64_CMP_I(1, tmp, GIC_PRIO_IRQON), ctx);
++				emit(A64_B_(A64_COND_NE, 3), ctx);
++				emit_a64_mov_i(1, tmp2, GIC_PRIO_IRQOFF, ctx);
++				emit(A64_MSR_SYSREG(tmp2, sysreg), ctx);
++			} else {
++				emit(A64_MSR_DAIFSET(3), ctx);
++			}
++			emit(A64_STR64I(tmp, dst, 0), ctx);
++		} else if (imm == BPF_IRQ_RESTORE) {
++			emit(A64_LDR64I(tmp, dst, 0), ctx);
++			emit(A64_MSR_SYSREG(tmp, sysreg), ctx);
++			if (pmr && !alternative_has_cap_likely(ARM64_HAS_GIC_PRIO_RELAXED_SYNC))
++				emit(aarch64_insn_gen_dsb(AARCH64_INSN_MB_SY), ctx);
++		} else {
++			return -EINVAL;
++		}
++		break;
++	}
++
+ 	/* ST: *(size *)(dst + off) = imm */
+ 	case BPF_ST | BPF_MEM | BPF_W:
+ 	case BPF_ST | BPF_MEM | BPF_H:
+@@ -3537,6 +3565,12 @@ bool bpf_jit_supports_percpu_insn(void)
+ 	return true;
+ }
+ 
++bool bpf_jit_supports_irq_save_restore(void)
++{
++	return !IS_ENABLED(CONFIG_TRACE_IRQFLAGS) &&
++	       !IS_ENABLED(CONFIG_ARM64_DEBUG_PRIORITY_MASKING);
++}
++
+ bool bpf_jit_bypass_spec_v4(void)
+ {
+ 	/* In case of arm64, we rely on the firmware mitigation of Speculative
+-- 
+2.52.0
+

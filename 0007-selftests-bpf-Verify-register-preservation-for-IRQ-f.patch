@@ -1,0 +1,171 @@
+From 1b717a3b06f7eb259142291ded441f5fa8ab2327 Mon Sep 17 00:00:00 2001
+From: Emil Tsalapatis <emil@etsalapatis.com>
+Date: Mon, 26 Oct 2026 14:58:28 -0700
+Subject: [PATCH bpf-next 7/7] selftests/bpf: Verify register preservation for
+ IRQ fastcalls
+
+Keep distinct runtime-derived values in R0 and R2-R5 across local IRQ
+save and restore calls, and check all ten captured register values.
+These void, single-argument kfuncs must preserve those registers when
+their BPF caller compatibility spills are removed during inlining.
+
+Provide matching stack spills and reloads around each call so the same
+program remains correct on configurations that use native kfunc calls.
+Check that the translated program either contains two internal IRQ
+instructions and no compatibility memory instructions, or retains all
+twenty compatibility instructions when the calls are not inlined.
+
+Run the program with context marks zero and one and sixteen repeats
+per mark. Always check the translated instructions and captured register
+values, without changing the system's JIT hardening configuration.
+
+Signed-off-by: Emil Tsalapatis <emil@etsalapatis.com>
+---
+ .../selftests/bpf/prog_tests/irq_fastcall.c   | 71 +++++++++++++++++++
+ .../selftests/bpf/progs/irq_fastcall.c        | 56 +++++++++++++++
+ 2 files changed, 127 insertions(+)
+ create mode 100644 tools/testing/selftests/bpf/prog_tests/irq_fastcall.c
+ create mode 100644 tools/testing/selftests/bpf/progs/irq_fastcall.c
+
+diff --git a/tools/testing/selftests/bpf/prog_tests/irq_fastcall.c b/tools/testing/selftests/bpf/prog_tests/irq_fastcall.c
+new file mode 100644
+index 000000000000..3c1073bc1e49
+--- /dev/null
++++ b/tools/testing/selftests/bpf/prog_tests/irq_fastcall.c
+@@ -0,0 +1,71 @@
++#include <test_progs.h>
++#include <network_helpers.h>
++#include "irq_fastcall.skel.h"
++
++static void check_spills(int prog_fd)
++{
++	struct bpf_prog_info info = {};
++	__u32 info_len = sizeof(info), xlated_len;
++	struct bpf_insn *insns;
++	int err, spill_count = 0, irq_count = 0;
++
++	err = bpf_prog_get_info_by_fd(prog_fd, &info, &info_len);
++	if (!ASSERT_OK(err, "prog_info"))
++		return;
++	xlated_len = info.xlated_prog_len;
++	insns = malloc(xlated_len);
++	if (!ASSERT_OK_PTR(insns, "insns"))
++		return;
++	memset(&info, 0, sizeof(info));
++	info.xlated_prog_len = xlated_len;
++	info.xlated_prog_insns = ptr_to_u64(insns);
++	err = bpf_prog_get_info_by_fd(prog_fd, &info, &info_len);
++	if (!ASSERT_OK(err, "xlated_info"))
++		goto out;
++	for (size_t insn_idx = 0; insn_idx < xlated_len / sizeof(*insns); insn_idx++) {
++		struct bpf_insn *insn = &insns[insn_idx];
++
++		if (insn->code == (BPF_ST | 0xe0))
++			irq_count++;
++		if ((insn->code == (BPF_STX | BPF_MEM | BPF_DW) &&
++		     insn->dst_reg == BPF_REG_10 && insn->off <= -16) ||
++		    (insn->code == (BPF_LDX | BPF_MEM | BPF_DW) &&
++		     insn->src_reg == BPF_REG_10 && insn->off <= -16))
++			spill_count++;
++	}
++	ASSERT_TRUE(irq_count == 0 || irq_count == 2, "irq_inlining");
++	ASSERT_EQ(spill_count, irq_count ? 0 : 20, "compatibility_spills");
++out:
++	free(insns);
++}
++
++void test_irq_fastcall(void)
++{
++	struct irq_fastcall *skel;
++	int prog_fd, err;
++
++	skel = irq_fastcall__open_and_load();
++	if (!ASSERT_OK_PTR(skel, "open_and_load"))
++		return;
++	prog_fd = bpf_program__fd(skel->progs.irq_fastcall_preserve);
++	check_spills(prog_fd);
++	for (int mark = 0; mark < 2; mark++) {
++		struct __sk_buff ctx = { .mark = mark };
++
++		LIBBPF_OPTS(bpf_test_run_opts, opts,
++			.data_in = &pkt_v4,
++			.data_size_in = sizeof(pkt_v4),
++			.ctx_in = &ctx,
++			.ctx_size_in = sizeof(ctx),
++			.repeat = 16,
++		);
++
++		err = bpf_prog_test_run_opts(prog_fd, &opts);
++		ASSERT_OK(err, "test_run");
++		ASSERT_EQ(opts.retval, 0, "retval");
++		for (int reg_idx = 0; reg_idx < 10; reg_idx++)
++			ASSERT_EQ(skel->bss->saved_regs[reg_idx],
++				  mark + 17 * (reg_idx % 5 + 1), "preserved_register");
++	}
++	irq_fastcall__destroy(skel);
++}
+diff --git a/tools/testing/selftests/bpf/progs/irq_fastcall.c b/tools/testing/selftests/bpf/progs/irq_fastcall.c
+new file mode 100644
+index 000000000000..3988e489c14f
+--- /dev/null
++++ b/tools/testing/selftests/bpf/progs/irq_fastcall.c
+@@ -0,0 +1,56 @@
++#include <vmlinux.h>
++#include <bpf/bpf_helpers.h>
++#include "bpf_misc.h"
++
++extern void bpf_local_irq_save(unsigned long *) __ksym __bpf_fastcall;
++extern void bpf_local_irq_restore(unsigned long *) __ksym __bpf_fastcall;
++
++__u64 saved_regs[10];
++
++void __kfunc_btf_root(void)
++{
++	asm volatile ("" : : "r"(&bpf_local_irq_save), "r"(&bpf_local_irq_restore));
++}
++
++#define IRQ_SET_REGS \
++	"r0 = r7; r0 += 17; r2 = r7; r2 += 34;" \
++	"r3 = r7; r3 += 51; r4 = r7; r4 += 68; r5 = r7; r5 += 85;"
++#define IRQ_SPILLS \
++	"*(u64 *)(r10 - 16) = r0;" \
++	"*(u64 *)(r10 - 24) = r2;" \
++	"*(u64 *)(r10 - 32) = r3;" \
++	"*(u64 *)(r10 - 40) = r4;" \
++	"*(u64 *)(r10 - 48) = r5;"
++#define IRQ_FILLS \
++	"r5 = *(u64 *)(r10 - 48);" \
++	"r4 = *(u64 *)(r10 - 40);" \
++	"r3 = *(u64 *)(r10 - 32);" \
++	"r2 = *(u64 *)(r10 - 24);" \
++	"r0 = *(u64 *)(r10 - 16);"
++#define IRQ_CAPTURE_REGS \
++	"*(u64 *)(r6 + 0) = r0;" \
++	"*(u64 *)(r6 + 8) = r2;" \
++	"*(u64 *)(r6 + 16) = r3;" \
++	"*(u64 *)(r6 + 24) = r4;" \
++	"*(u64 *)(r6 + 32) = r5;"
++
++SEC("tc")
++__naked int irq_fastcall_preserve(void)
++{
++	asm volatile (
++		"r7 = *(u32 *)(r1 + 8); r6 = %[saved_regs] ll;"
++		"r1 = r10; r1 += -8;"
++		IRQ_SET_REGS IRQ_SPILLS
++		"call %[bpf_local_irq_save];"
++		IRQ_FILLS IRQ_CAPTURE_REGS
++		"r6 += 40; r1 = r10; r1 += -8;"
++		IRQ_SET_REGS IRQ_SPILLS
++		"call %[bpf_local_irq_restore];"
++		IRQ_FILLS IRQ_CAPTURE_REGS
++		"r0 = 0; exit;"
++		:
++		: __imm(bpf_local_irq_save), __imm(bpf_local_irq_restore), __imm_addr(saved_regs)
++		: __clobber_all);
++}
++
++char _license[] SEC("license") = "GPL";
+-- 
+2.52.0
+

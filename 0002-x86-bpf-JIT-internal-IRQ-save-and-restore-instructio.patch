@@ -1,0 +1,64 @@
+From a9e91677ae80cecd3d7214952d76117fc93553de Mon Sep 17 00:00:00 2001
+From: Emil Tsalapatis <emil@etsalapatis.com>
+Date: Fri, 23 Oct 2026 13:45:28 -0700
+Subject: [PATCH bpf-next 2/7] x86, bpf: JIT internal IRQ save and restore
+ instructions
+
+Implement the internal IRQ save/restore instruction in the x86-64 JIT,
+using the encoded destination register as the flags pointer.
+
+Save RFLAGS, disable interrupts and store the flags through that pointer.
+Restore loads the saved flags and enables interrupts only when the saved
+interrupt-enable bit is set.
+
+Advertise support only when IRQ tracing and paravirtualized IRQ
+operations do not require additional work.
+
+Signed-off-by: Emil Tsalapatis <emil@etsalapatis.com>
+---
+ arch/x86/net/bpf_jit_comp.c | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/arch/x86/net/bpf_jit_comp.c b/arch/x86/net/bpf_jit_comp.c
+index 6a2fe3d0039d..62833c0f7c97 100644
+--- a/arch/x86/net/bpf_jit_comp.c
++++ b/arch/x86/net/bpf_jit_comp.c
+@@ -3089,6 +3089,23 @@ static int do_jit(struct bpf_verifier_env *env, struct bpf_prog *bpf_prog, int *
+ 			EMIT_LFENCE();
+ 			break;
+ 
++		case BPF_ST | BPF_IRQ:
++			if (imm32 == BPF_IRQ_SAVE) {
++				EMIT1(0x9c);
++				EMIT2(0x41, add_1reg(0x58, BPF_REG_AX));
++				EMIT1(0xfa);
++				emit_stx(&prog, BPF_DW, dst_reg, BPF_REG_AX, 0);
++			} else if (imm32 == BPF_IRQ_RESTORE) {
++				emit_ldx(&prog, BPF_DW, BPF_REG_AX, dst_reg, 0);
++				maybe_emit_1mod(&prog, BPF_REG_AX, true);
++				EMIT2_off32(0xf7, add_1reg(0xc0, BPF_REG_AX), X86_EFLAGS_IF);
++				EMIT2(X86_JE, 1);
++				EMIT1(0xfb);
++			} else {
++				return -EINVAL;
++			}
++			break;
++
+ 		case BPF_ST | BPF_MEM | BPF_B:
+ 		case BPF_ST | BPF_MEM | BPF_H:
+ 		case BPF_ST | BPF_MEM | BPF_W:
+@@ -5116,6 +5133,11 @@ bool bpf_jit_supports_kfunc_call(void)
+ 	return true;
+ }
+ 
++bool bpf_jit_supports_irq_save_restore(void)
++{
++	return !IS_ENABLED(CONFIG_TRACE_IRQFLAGS) && !IS_ENABLED(CONFIG_PARAVIRT_XXL);
++}
++
+ bool bpf_jit_supports_kfunc_ret_reg_pair(void)
+ {
+ 	return true;
+-- 
+2.52.0
+

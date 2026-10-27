@@ -1,0 +1,47 @@
+From f6f5223d26c40ae40ff6f44188390aa06d47fc2b Mon Sep 17 00:00:00 2001
+From: Emil Tsalapatis <emil@etsalapatis.com>
+Date: Fri, 23 Oct 2026 13:45:28 -0700
+Subject: [PATCH bpf-next 4/7] bpf: Inline local IRQ kfunc calls during
+ verifier fixup
+
+Replace calls to the core bpf_local_irq_save() and
+bpf_local_irq_restore() kfuncs with the corresponding internal IRQ
+instruction when the selected JIT advertises support. Encode R1, the
+flags-pointer argument register, as the instruction destination.
+
+This runs after the original call has been checked. The existing
+process_irq_flag() validation checks the stack flags operand and tracks
+its initialization and IRQ-region state, so the fixup does not accept new
+operand types or bypass those checks.
+
+Keep calls unchanged for unsupported backends and configurations.
+
+Signed-off-by: Emil Tsalapatis <emil@etsalapatis.com>
+---
+ kernel/bpf/verifier.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 5601d2056218..aff7080b5c85 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -23372,6 +23372,16 @@ int bpf_fixup_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
+ 			     insn->imm);
+ 		return -EFAULT;
+ 	}
++	if (!desc->offset && bpf_jit_supports_irq_save_restore() &&
++	    (desc->func_id == special_kfunc_list[KF_bpf_local_irq_save] ||
++	     desc->func_id == special_kfunc_list[KF_bpf_local_irq_restore])) {
++		int irq_op = desc->func_id == special_kfunc_list[KF_bpf_local_irq_save] ?
++			     BPF_IRQ_SAVE : BPF_IRQ_RESTORE;
++
++		insn_buf[0] = BPF_IRQ_INSN(irq_op, BPF_REG_1);
++		*cnt = 1;
++		return 0;
++	}
+ 	base_desc_idx = desc - env->prog->aux->kfunc_tab->descs;
+ 
+ 	near_call = !bpf_jit_supports_far_kfunc_call();
+-- 
+2.52.0
+

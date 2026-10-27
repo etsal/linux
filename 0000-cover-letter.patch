@@ -1,0 +1,62 @@
+From 1b717a3b06f7eb259142291ded441f5fa8ab2327 Mon Sep 17 00:00:00 2001
+From: Emil Tsalapatis <emil@etsalapatis.com>
+Date: Mon, 26 Oct 2026 16:31:14 -0700
+Subject: [PATCH bpf-next 0/7] bpf: Inline IRQ enter/exit instructions
+
+The functions bpf_local_irq_save and bpf_local_irq_restore are only
+a couple instructions long, since they are thin wrappers around
+local_irq_save()/local_irq_restore(). However, they still require
+a full call along with caller register save and restore. Since these
+functions are used extensively in performance-critical code like
+spinlocks, it is desireable to reduce their overhead.
+
+Add inlining for those functions. The inlining happens in two stages.
+First replace the call itself with a special BPF instruction denoting
+an IRQ disable-and save, or restore-and-enable. Those instructions
+are translated by the architecture-specific JIT into the corresponding
+operation. There is no functional difference between the emitted code
+and local_irq_save/restore(). Inlining reduces the overall latency of
+a no-op critical sections from 47ns to 29ns on a high-end Zen 5 machine.
+
+Add support for this inlining to the x86 and aarch64 JITs. The fixup
+does not happen for JITs without explicit support, or for kernel
+configurations that change the code run during local_irq_save/restore().
+
+Mark the functions as fastcalls to remove caller register pushing and
+popping. The calls are only marked as fastcalls when they are valid
+for inlining, so the calls are not marked if not eligible or in
+architectures that do not support inlining.
+
+Signed-off-by: Emil Tsalapatis <emil@etsalapatis.com>
+
+Emil Tsalapatis (7):
+  bpf: Add internal IRQ save and restore instructions
+  x86, bpf: JIT internal IRQ save and restore instructions
+  arm64, bpf: JIT internal IRQ save and restore instructions
+  bpf: Inline local IRQ kfunc calls during verifier fixup
+  selftests/bpf: Test local IRQ kfunc inlining
+  bpf: Enable fastcall for inlined local IRQ kfuncs
+  selftests/bpf: Verify register preservation for IRQ fastcalls
+
+ arch/arm64/net/bpf_jit.h                      |   8 ++
+ arch/arm64/net/bpf_jit_comp.c                 |  34 +++++
+ arch/x86/net/bpf_jit_comp.c                   |  22 +++
+ include/linux/filter.h                        |  13 ++
+ kernel/bpf/core.c                             |   5 +
+ kernel/bpf/disasm.c                           |   8 ++
+ kernel/bpf/helpers.c                          |   4 +-
+ kernel/bpf/verifier.c                         |  17 +++
+ .../selftests/bpf/prog_tests/irq_fastcall.c   |  71 ++++++++++
+ .../selftests/bpf/prog_tests/irq_jit.c        | 128 ++++++++++++++++++
+ tools/testing/selftests/bpf/progs/irq.c       |  24 ++++
+ .../selftests/bpf/progs/irq_fastcall.c        |  56 ++++++++
+ tools/testing/selftests/bpf/progs/irq_jit.c   |  55 ++++++++
+ 13 files changed, 443 insertions(+), 2 deletions(-)
+ create mode 100644 tools/testing/selftests/bpf/prog_tests/irq_fastcall.c
+ create mode 100644 tools/testing/selftests/bpf/prog_tests/irq_jit.c
+ create mode 100644 tools/testing/selftests/bpf/progs/irq_fastcall.c
+ create mode 100644 tools/testing/selftests/bpf/progs/irq_jit.c
+
+-- 
+2.52.0
+

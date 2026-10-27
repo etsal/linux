@@ -1,0 +1,79 @@
+From f6ff77f4c0e60ae164065ea6de2bb876f1bfa1fa Mon Sep 17 00:00:00 2001
+From: Emil Tsalapatis <emil@etsalapatis.com>
+Date: Mon, 26 Oct 2026 14:58:28 -0700
+Subject: [PATCH bpf-next 6/7] bpf: Enable fastcall for inlined local IRQ
+ kfuncs
+
+Mark bpf_local_irq_save() and bpf_local_irq_restore() with KF_FASTCALL
+so the verifier can remove BPF caller compatibility spills and reloads
+around calls that are replaced with internal IRQ instructions.
+
+Only enable this optimization when bpf_jit_supports_irq_save_restore()
+reports support. Backends and configurations that keep the native kfunc
+calls must retain the compatibility spills, since those functions use
+the ordinary native calling convention.
+
+Share the IRQ kfunc identification helper between the call summary and
+the late fixup so the fastcall decision follows the same backend gate
+as inlining. Leave the native function implementations unchanged.
+
+Signed-off-by: Emil Tsalapatis <emil@etsalapatis.com>
+---
+ kernel/bpf/helpers.c  |  4 ++--
+ kernel/bpf/verifier.c | 11 +++++++++--
+ 2 files changed, 11 insertions(+), 4 deletions(-)
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index 648abe1ba63a..26b6a9df0d45 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -5197,8 +5197,8 @@ BTF_ID_FLAGS(func, bpf_get_kmem_cache, KF_PERFMON)
+ BTF_ID_FLAGS(func, bpf_iter_kmem_cache_new, KF_ITER_NEW | KF_SLEEPABLE)
+ BTF_ID_FLAGS(func, bpf_iter_kmem_cache_next, KF_ITER_NEXT | KF_RET_NULL | KF_SLEEPABLE)
+ BTF_ID_FLAGS(func, bpf_iter_kmem_cache_destroy, KF_ITER_DESTROY | KF_SLEEPABLE)
+-BTF_ID_FLAGS(func, bpf_local_irq_save)
+-BTF_ID_FLAGS(func, bpf_local_irq_restore)
++BTF_ID_FLAGS(func, bpf_local_irq_save, KF_FASTCALL)
++BTF_ID_FLAGS(func, bpf_local_irq_restore, KF_FASTCALL)
+ #ifdef CONFIG_BPF_EVENTS
+ BTF_ID_FLAGS(func, bpf_probe_read_user_dynptr, KF_PERFMON)
+ BTF_ID_FLAGS(func, bpf_probe_read_kernel_dynptr, KF_PERFMON)
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index aff7080b5c85..b1ea1564e959 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -19605,6 +19605,12 @@ bool bpf_verifier_inlines_helper_call(struct bpf_verifier_env *env, s32 imm)
+ 	}
+ }
+ 
++static bool is_bpf_local_irq_kfunc(u32 func_id)
++{
++	return func_id == special_kfunc_list[KF_bpf_local_irq_save] ||
++	       func_id == special_kfunc_list[KF_bpf_local_irq_restore];
++}
++
+ /* If @call is a kfunc or helper call, fills @cs and returns true,
+  * otherwise returns false.
+  */
+@@ -19641,6 +19647,8 @@ bool bpf_get_call_summary(struct bpf_verifier_env *env, struct bpf_insn *call,
+ 			return false;
+ 		cs->arg_slot_cnt = btf_proto_slots(meta.btf, meta.func_proto);
+ 		cs->fastcall = meta.kfunc_flags & KF_FASTCALL;
++		if (!call->off && is_bpf_local_irq_kfunc(meta.func_id))
++			cs->fastcall &= bpf_jit_supports_irq_save_restore();
+ 		cs->is_void = btf_type_is_void(btf_type_by_id(meta.btf, meta.func_proto->type));
+ 		return true;
+ 	}
+@@ -23373,8 +23381,7 @@ int bpf_fixup_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
+ 		return -EFAULT;
+ 	}
+ 	if (!desc->offset && bpf_jit_supports_irq_save_restore() &&
+-	    (desc->func_id == special_kfunc_list[KF_bpf_local_irq_save] ||
+-	     desc->func_id == special_kfunc_list[KF_bpf_local_irq_restore])) {
++	    is_bpf_local_irq_kfunc(desc->func_id)) {
+ 		int irq_op = desc->func_id == special_kfunc_list[KF_bpf_local_irq_save] ?
+ 			     BPF_IRQ_SAVE : BPF_IRQ_RESTORE;
+ 
+-- 
+2.52.0
+

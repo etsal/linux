@@ -1,0 +1,105 @@
+From bb1490fc8e090f426affccd7b535c1badfbf5367 Mon Sep 17 00:00:00 2001
+From: Emil Tsalapatis <emil@etsalapatis.com>
+Date: Fri, 23 Oct 2026 13:45:28 -0700
+Subject: [PATCH bpf-next 1/7] bpf: Add internal IRQ save and restore
+ instructions
+
+Introduce a kernel-private BPF_ST | BPF_IRQ instruction with save and
+restore operations. Encode the flags-pointer register in dst_reg and the
+operation in imm, leaving src_reg and off reserved as zero.
+
+Add a JIT capability hook whose default implementation declines support,
+plus disassembler output for both operations. Architecture backends opt
+in separately, and the verifier starts emitting the instructions in a
+later patch.
+
+Signed-off-by: Emil Tsalapatis <emil@etsalapatis.com>
+---
+ include/linux/filter.h | 13 +++++++++++++
+ kernel/bpf/core.c      |  5 +++++
+ kernel/bpf/disasm.c    |  8 ++++++++
+ 3 files changed, 26 insertions(+)
+
+diff --git a/include/linux/filter.h b/include/linux/filter.h
+index e0218e677a1d..bf67dfa19c17 100644
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@ -90,6 +90,10 @@ struct ctl_table_header;
+  */
+ #define BPF_NOSPEC	0xc0
+ 
++#define BPF_IRQ		0xe0
++#define BPF_IRQ_SAVE	0
++#define BPF_IRQ_RESTORE	1
++
+ /* As per nm, we expose JITed images as text (code) section for
+  * kallsyms. That way, tools like perf can find it to match
+  * addresses.
+@@ -598,6 +602,14 @@ static inline int bpf_atomic_load_reg(const struct bpf_insn *insn)
+ 		.off   = 0,					\
+ 		.imm   = 0 })
+ 
++#define BPF_IRQ_INSN(OP, FLAGS_REG)				\
++	((struct bpf_insn) {					\
++		.code  = BPF_ST | BPF_IRQ,			\
++		.dst_reg = FLAGS_REG,				\
++		.src_reg = 0,					\
++		.off   = 0,					\
++		.imm   = OP })
++
+ /* Internal classic blocks for direct assignment */
+ 
+ #define __BPF_STMT(CODE, K)					\
+@@ -1277,6 +1289,7 @@ bool bpf_jit_needs_zext(void);
+ bool bpf_jit_inlines_helper_call(s32 imm);
+ bool bpf_jit_supports_subprog_tailcalls(void);
+ bool bpf_jit_supports_percpu_insn(void);
++bool bpf_jit_supports_irq_save_restore(void);
+ bool bpf_jit_supports_kfunc_call(void);
+ bool bpf_jit_supports_callx(void);
+ bool bpf_jit_supports_kfunc_ret_reg_pair(void);
+diff --git a/kernel/bpf/core.c b/kernel/bpf/core.c
+index 3030beb531d9..0ab9a210e1e8 100644
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@ -3383,6 +3383,11 @@ bool __weak bpf_jit_supports_percpu_insn(void)
+ 	return false;
+ }
+ 
++bool __weak bpf_jit_supports_irq_save_restore(void)
++{
++	return false;
++}
++
+ bool __weak bpf_jit_supports_kfunc_call(void)
+ {
+ 	return false;
+diff --git a/kernel/bpf/disasm.c b/kernel/bpf/disasm.c
+index 889fc074496f..125e2c5754e9 100644
+--- a/kernel/bpf/disasm.c
++++ b/kernel/bpf/disasm.c
+@@ -9,6 +9,9 @@
+ 
+ /* Only defined by the non-UAPI linux/filter.h, which this file cannot use. */
+ #define BPF_PROBE_ATOMIC 0xe0
++#define BPF_IRQ 0xe0
++#define BPF_IRQ_SAVE 0
++#define BPF_IRQ_RESTORE 1
+ 
+ #define __BPF_FUNC_STR_FN(x) [BPF_FUNC_ ## x] = __stringify(bpf_ ## x)
+ static const char * const func_id_str[] = {
+@@ -294,6 +297,11 @@ void print_bpf_insn(const struct bpf_insn_cbs *cbs,
+ 				insn->off, insn->imm);
+ 		} else if (BPF_MODE(insn->code) == 0xc0 /* BPF_NOSPEC, no UAPI */) {
+ 			verbose(cbs->private_data, "(%02x) nospec", insn->code);
++		} else if (insn->code == (BPF_ST | BPF_IRQ) &&
++			   (insn->imm == BPF_IRQ_SAVE || insn->imm == BPF_IRQ_RESTORE)) {
++			verbose(cbs->private_data, "(%02x) bpf_local_irq_%s(r%d)",
++				insn->code, insn->imm == BPF_IRQ_SAVE ? "save" : "restore",
++				insn->dst_reg);
+ 		} else {
+ 			verbose(cbs->private_data, "BUG_st_%02x", insn->code);
+ 		}
+-- 
+2.52.0
+
