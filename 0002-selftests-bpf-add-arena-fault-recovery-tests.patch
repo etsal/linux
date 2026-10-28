@@ -1,0 +1,315 @@
+From 24e1f7678ad0ba10fcd078d7067c8411c6c49d2d Mon Sep 17 00:00:00 2001
+From: Emil Tsalapatis <emil@etsalapatis.com>
+Date: Tue, 27 Oct 2026 17:12:15 -0700
+Subject: [PATCH bpf 2/2] selftests/bpf: add arena fault recovery tests
+
+Test the arena fault handling code with two new selftests.
+The first one confirms that a program without an arena (and
+by extension a code path that doesn't involve BPF at all)
+properly recovers after accessing an unbacked arena page.
+The second test deploys the same configuration for a program
+that has its own arena map.
+
+Signed-off-by: Emil Tsalapatis <emil@etsalapatis.com>
+---
+ tools/testing/selftests/bpf/Makefile          |  2 +-
+ .../selftests/bpf/prog_tests/arena_fault.c    | 91 +++++++++++++++++++
+ .../testing/selftests/bpf/progs/arena_fault.c | 55 +++++++++++
+ .../selftests/bpf/progs/arena_fault_noarena.c | 17 ++++
+ .../testing/selftests/bpf/test_kmods/Makefile |  2 +-
+ .../bpf/test_kmods/bpf_test_arena_fault.c     | 55 +++++++++++
+ .../bpf/test_kmods/bpf_test_arena_fault.h     | 10 ++
+ 7 files changed, 230 insertions(+), 2 deletions(-)
+ create mode 100644 tools/testing/selftests/bpf/prog_tests/arena_fault.c
+ create mode 100644 tools/testing/selftests/bpf/progs/arena_fault.c
+ create mode 100644 tools/testing/selftests/bpf/progs/arena_fault_noarena.c
+ create mode 100644 tools/testing/selftests/bpf/test_kmods/bpf_test_arena_fault.c
+ create mode 100644 tools/testing/selftests/bpf/test_kmods/bpf_test_arena_fault.h
+
+diff --git a/tools/testing/selftests/bpf/Makefile b/tools/testing/selftests/bpf/Makefile
+index 1e4af62e8312..97d4a266abed 100644
+--- a/tools/testing/selftests/bpf/Makefile
++++ b/tools/testing/selftests/bpf/Makefile
+@@ -47,7 +47,7 @@ TEST_PROGS_EXTENDED := \
+ 	ima_setup.sh verify_sig_setup.sh
+ 
+ TEST_KMODS := bpf_testmod.ko bpf_test_no_cfi.ko bpf_test_modorder_x.ko \
+-	bpf_test_modorder_y.ko bpf_test_rqspinlock.ko
++	bpf_test_modorder_y.ko bpf_test_rqspinlock.ko bpf_test_arena_fault.ko
+ TEST_KMOD_TARGETS = $(addprefix $(OUTPUT)/,$(TEST_KMODS))
+ 
+ # Compile but not part of 'make run_tests'
+diff --git a/tools/testing/selftests/bpf/prog_tests/arena_fault.c b/tools/testing/selftests/bpf/prog_tests/arena_fault.c
+new file mode 100644
+index 000000000000..7134ece16a31
+--- /dev/null
++++ b/tools/testing/selftests/bpf/prog_tests/arena_fault.c
+@@ -0,0 +1,91 @@
++// SPDX-License-Identifier: GPL-2.0
++
++#include <test_progs.h>
++#include <testing_helpers.h>
++#include "arena_fault.skel.h"
++#include "arena_fault_noarena.skel.h"
++
++#define ARENA_FAULT_MOD "bpf_test_arena_fault"
++
++static int run_syscall_prog(struct bpf_program *prog, const char *name)
++{
++	LIBBPF_OPTS(bpf_test_run_opts, opts);
++	int err;
++
++	err = bpf_prog_test_run_opts(bpf_program__fd(prog), &opts);
++	if (!ASSERT_OK(err, name))
++		return -1;
++	if (!ASSERT_OK(opts.retval, name))
++		return -1;
++	return 0;
++}
++
++static void test_wrong_arena(void)
++{
++	struct arena_fault *fault_skel = NULL;
++	struct arena_fault *stash_skel = NULL;
++
++	stash_skel = arena_fault__open_and_load();
++	if (!ASSERT_OK_PTR(stash_skel, "open_load_stash"))
++		return;
++
++	fault_skel = arena_fault__open_and_load();
++	if (!ASSERT_OK_PTR(fault_skel, "open_load_fault"))
++		goto out;
++
++	if (run_syscall_prog(stash_skel->progs.stash_and_free, "stash_and_free"))
++		goto out;
++	run_syscall_prog(fault_skel->progs.fault_stashed_wrong_arena,
++			 "fault_stashed_wrong_arena");
++
++out:
++	if (stash_skel)
++		run_syscall_prog(stash_skel->progs.clear_stashed, "clear_stashed");
++	arena_fault__destroy(fault_skel);
++	arena_fault__destroy(stash_skel);
++}
++
++static void test_no_arena(void)
++{
++	struct arena_fault_noarena *fault_skel = NULL;
++	struct arena_fault *stash_skel = NULL;
++
++	stash_skel = arena_fault__open_and_load();
++	if (!ASSERT_OK_PTR(stash_skel, "open_load_stash"))
++		return;
++
++	fault_skel = arena_fault_noarena__open_and_load();
++	if (!ASSERT_OK_PTR(fault_skel, "open_load_noarena"))
++		goto out;
++
++	if (run_syscall_prog(stash_skel->progs.stash_and_free, "stash_and_free"))
++		goto out;
++	run_syscall_prog(fault_skel->progs.fault_stashed_noarena,
++			 "fault_stashed_noarena");
++
++out:
++	if (stash_skel)
++		run_syscall_prog(stash_skel->progs.clear_stashed, "clear_stashed");
++	arena_fault_noarena__destroy(fault_skel);
++	arena_fault__destroy(stash_skel);
++}
++
++void serial_test_arena_fault(void)
++{
++#if !defined(__x86_64__) && !defined(__aarch64__)
++	test__skip();
++	return;
++#endif
++
++	if (!ASSERT_OK(load_module(ARENA_FAULT_MOD ".ko",
++				   env_verbosity > VERBOSE_NONE),
++		       "load " ARENA_FAULT_MOD ".ko"))
++		return;
++
++	if (test__start_subtest("wrong_arena"))
++		test_wrong_arena();
++	if (test__start_subtest("no_arena"))
++		test_no_arena();
++
++	unload_module(ARENA_FAULT_MOD, env_verbosity > VERBOSE_NONE);
++}
+diff --git a/tools/testing/selftests/bpf/progs/arena_fault.c b/tools/testing/selftests/bpf/progs/arena_fault.c
+new file mode 100644
+index 000000000000..1967b128fdf6
+--- /dev/null
++++ b/tools/testing/selftests/bpf/progs/arena_fault.c
+@@ -0,0 +1,55 @@
++// SPDX-License-Identifier: GPL-2.0
++
++#define BPF_NO_KFUNC_PROTOTYPES
++#include <vmlinux.h>
++#include <bpf/bpf_helpers.h>
++#include "bpf_arena_common.h"
++#include "../test_kmods/bpf_test_arena_fault.h"
++
++struct {
++	__uint(type, BPF_MAP_TYPE_ARENA);
++	__uint(map_flags, BPF_F_MMAPABLE);
++	__uint(max_entries, 2);
++} arena SEC(".maps");
++
++u64 __arena arena_pad;
++volatile u64 observed;
++
++SEC("syscall")
++int stash_and_free(void *ctx)
++{
++	u64 __arena *val;
++
++	val = bpf_arena_alloc_pages(&arena, NULL, 1, NUMA_NO_NODE, 0);
++	if (!val)
++		return 1;
++
++	*val = 42;
++	bpf_test_arena_fault_stash((u64 *)val);
++	bpf_arena_free_pages(&arena, val, 1);
++	return 0;
++}
++
++SEC("syscall")
++int fault_stashed_wrong_arena(void *ctx)
++{
++	u64 __arena *val;
++
++	val = bpf_arena_alloc_pages(&arena, NULL, 1, NUMA_NO_NODE, 0);
++	if (!val)
++		return 1;
++
++	*val = 1;
++	observed = bpf_test_arena_fault_load_stashed();
++	bpf_arena_free_pages(&arena, val, 1);
++	return observed != 0;
++}
++
++SEC("syscall")
++int clear_stashed(void *ctx)
++{
++	bpf_test_arena_fault_clear_stashed();
++	return 0;
++}
++
++char _license[] SEC("license") = "GPL";
+diff --git a/tools/testing/selftests/bpf/progs/arena_fault_noarena.c b/tools/testing/selftests/bpf/progs/arena_fault_noarena.c
+new file mode 100644
+index 000000000000..7fa8814808b5
+--- /dev/null
++++ b/tools/testing/selftests/bpf/progs/arena_fault_noarena.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: GPL-2.0
++
++#define BPF_NO_KFUNC_PROTOTYPES
++#include <vmlinux.h>
++#include <bpf/bpf_helpers.h>
++#include "../test_kmods/bpf_test_arena_fault.h"
++
++volatile u64 observed;
++
++SEC("syscall")
++int fault_stashed_noarena(void *ctx)
++{
++	observed = bpf_test_arena_fault_load_stashed();
++	return observed != 0;
++}
++
++char _license[] SEC("license") = "GPL";
+diff --git a/tools/testing/selftests/bpf/test_kmods/Makefile b/tools/testing/selftests/bpf/test_kmods/Makefile
+index 031c7454ce65..e611e71fcef1 100644
+--- a/tools/testing/selftests/bpf/test_kmods/Makefile
++++ b/tools/testing/selftests/bpf/test_kmods/Makefile
+@@ -19,7 +19,7 @@ Q = @
+ endif
+ 
+ MODULES = bpf_testmod.ko bpf_test_no_cfi.ko bpf_test_modorder_x.ko \
+-	bpf_test_modorder_y.ko bpf_test_rqspinlock.ko
++	bpf_test_modorder_y.ko bpf_test_rqspinlock.ko bpf_test_arena_fault.ko
+ 
+ $(foreach m,$(MODULES),$(eval obj-m += $(m:.ko=.o)))
+ 
+diff --git a/tools/testing/selftests/bpf/test_kmods/bpf_test_arena_fault.c b/tools/testing/selftests/bpf/test_kmods/bpf_test_arena_fault.c
+new file mode 100644
+index 000000000000..0b3dbf80344d
+--- /dev/null
++++ b/tools/testing/selftests/bpf/test_kmods/bpf_test_arena_fault.c
+@@ -0,0 +1,55 @@
++// SPDX-License-Identifier: GPL-2.0
++
++#include <linux/bpf.h>
++#include <linux/btf.h>
++#include <linux/module.h>
++
++static u64 *stashed_ptr;
++
++__bpf_kfunc_start_defs();
++
++__bpf_kfunc void bpf_test_arena_fault_stash(u64 *ptr__arena)
++{
++	WRITE_ONCE(stashed_ptr, ptr__arena);
++}
++
++__bpf_kfunc u64 bpf_test_arena_fault_load_stashed(void)
++{
++	u64 *ptr = READ_ONCE(stashed_ptr);
++
++	return ptr ? READ_ONCE(*ptr) : U64_MAX;
++}
++
++__bpf_kfunc void bpf_test_arena_fault_clear_stashed(void)
++{
++	WRITE_ONCE(stashed_ptr, NULL);
++}
++
++__bpf_kfunc_end_defs();
++
++BTF_KFUNCS_START(bpf_test_arena_fault_kfunc_ids)
++BTF_ID_FLAGS(func, bpf_test_arena_fault_stash)
++BTF_ID_FLAGS(func, bpf_test_arena_fault_load_stashed)
++BTF_ID_FLAGS(func, bpf_test_arena_fault_clear_stashed)
++BTF_KFUNCS_END(bpf_test_arena_fault_kfunc_ids)
++
++static const struct btf_kfunc_id_set bpf_test_arena_fault_kfunc_set = {
++	.owner = THIS_MODULE,
++	.set = &bpf_test_arena_fault_kfunc_ids,
++};
++
++static int __init bpf_test_arena_fault_init(void)
++{
++	return register_btf_kfunc_id_set(BPF_PROG_TYPE_UNSPEC,
++					 &bpf_test_arena_fault_kfunc_set);
++}
++
++static void __exit bpf_test_arena_fault_exit(void)
++{
++}
++
++module_init(bpf_test_arena_fault_init);
++module_exit(bpf_test_arena_fault_exit);
++
++MODULE_DESCRIPTION("BPF arena fault selftest module");
++MODULE_LICENSE("GPL");
+diff --git a/tools/testing/selftests/bpf/test_kmods/bpf_test_arena_fault.h b/tools/testing/selftests/bpf/test_kmods/bpf_test_arena_fault.h
+new file mode 100644
+index 000000000000..1657c445a0fa
+--- /dev/null
++++ b/tools/testing/selftests/bpf/test_kmods/bpf_test_arena_fault.h
+@@ -0,0 +1,10 @@
++// SPDX-License-Identifier: GPL-2.0
++
++#ifndef __BPF_TEST_ARENA_FAULT_H
++#define __BPF_TEST_ARENA_FAULT_H
++
++void bpf_test_arena_fault_stash(__u64 *ptr__arena) __ksym;
++__u64 bpf_test_arena_fault_load_stashed(void) __ksym;
++void bpf_test_arena_fault_clear_stashed(void) __ksym;
++
++#endif /* __BPF_TEST_ARENA_FAULT_H */
+-- 
+2.52.0
+

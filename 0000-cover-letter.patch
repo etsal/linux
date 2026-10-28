@@ -1,0 +1,44 @@
+From 24e1f7678ad0ba10fcd078d7067c8411c6c49d2d Mon Sep 17 00:00:00 2001
+From: Emil Tsalapatis <emil@etsalapatis.com>
+Date: Tue, 27 Oct 2026 18:45:13 -0700
+Subject: [PATCH bpf-next 0/2] bpf: expand BPF arena kernel fault handling
+
+Currently, the BPF arena fault handler protects against
+a misbehaving BPF program passing an arena pointer to a
+kfunc then unmapping the backing pages, causing a kernel
+fault. However, it does not handle errors where the now
+unmapped arena address is instead accessed by a non-BPF
+path, or by a BPF program that has a different arena.
+The former case is already possible in sched-ext if a
+BPF program removes from the arena pages allocated
+from the genpool allocator.
+
+Keep a list of all arenas in the system and attempt to match
+kernel faults to all of them. If the fault does fall in an
+arena, handle it with the already established scratch
+page technique and retry the access.
+
+Signed-off-by: Emil Tsalapatis <emil@etsalapatis.com>
+
+Emil Tsalapatis (2):
+  bpf: recover page faults across all arenas
+  selftests/bpf: add arena fault recovery tests
+
+ kernel/bpf/arena.c                            | 54 +++++++----
+ tools/testing/selftests/bpf/Makefile          |  2 +-
+ .../selftests/bpf/prog_tests/arena_fault.c    | 91 +++++++++++++++++++
+ .../testing/selftests/bpf/progs/arena_fault.c | 55 +++++++++++
+ .../selftests/bpf/progs/arena_fault_noarena.c | 17 ++++
+ .../testing/selftests/bpf/test_kmods/Makefile |  2 +-
+ .../bpf/test_kmods/bpf_test_arena_fault.c     | 55 +++++++++++
+ .../bpf/test_kmods/bpf_test_arena_fault.h     | 10 ++
+ 8 files changed, 265 insertions(+), 21 deletions(-)
+ create mode 100644 tools/testing/selftests/bpf/prog_tests/arena_fault.c
+ create mode 100644 tools/testing/selftests/bpf/progs/arena_fault.c
+ create mode 100644 tools/testing/selftests/bpf/progs/arena_fault_noarena.c
+ create mode 100644 tools/testing/selftests/bpf/test_kmods/bpf_test_arena_fault.c
+ create mode 100644 tools/testing/selftests/bpf/test_kmods/bpf_test_arena_fault.h
+
+-- 
+2.52.0
+

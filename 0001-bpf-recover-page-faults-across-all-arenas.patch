@@ -1,0 +1,147 @@
+From 8ef7773bf34cbd3cae46506010456fd5e7f9c5e9 Mon Sep 17 00:00:00 2001
+From: Emil Tsalapatis <emil@etsalapatis.com>
+Date: Tue, 27 Oct 2026 15:45:12 -0700
+Subject: [PATCH bpf 1/2] bpf: recover page faults across all arenas
+
+The current arena fault handling code accounts for
+misbehaving BPF programs that free arena memory
+while it is being accessed by a kfunc as part of
+another BPF program's execution. This scenario
+triggers a kernel page fault that is intercepted
+by BPF arena-specific code. The code confirms
+that the fault is within the BPF program's arena,
+installs a scratch page, and marks the fault as
+handled. This is necessary to prevent BPF programs
+from being able to trigger an oops.
+
+However, the protection against misbehaving BPF programs
+is currently incomplete: Arena memory is accessed by
+kernel code not just as part of a kfunc, but also from
+non-BPF paths. This is the case with sched-ext that
+includes non-BPF code paths that access arena pointers.
+These paths do not have an arena associated with them,
+and a fault there causes an oops. Such a fault can be
+triggered by a misbehaving BPF program by unmapping the
+pages nominally owned by the genpool allocator used for
+cid management.
+
+Extend the kernel arena fault handling to consider all
+arenas in the system. The handler now scans a global
+arena list till it finds an arena that includes the address,
+and fixes up the address. Retain the stream-based reporting
+code for when the faulting call stack includes the BPF
+program that owns the arena.
+
+Fixes: 9eca087deb0b ("sched_ext: Sub-allocator over kernel-claimed BPF arena pages")
+Cc: Tejun Heo <htejun@kernel.org>
+Signed-off-by: Emil Tsalapatis <emil@etsalapatis.com>
+---
+ kernel/bpf/arena.c | 54 ++++++++++++++++++++++++++++++----------------
+ 1 file changed, 35 insertions(+), 19 deletions(-)
+
+diff --git a/kernel/bpf/arena.c b/kernel/bpf/arena.c
+index 868589f07330..992a0b123449 100644
+--- a/kernel/bpf/arena.c
++++ b/kernel/bpf/arena.c
+@@ -10,6 +10,7 @@
+ #include <linux/btf_ids.h>
+ #include <linux/vmalloc.h>
+ #include <linux/pagemap.h>
++#include <linux/rculist.h>
+ #include <asm/tlbflush.h>
+ #include "range_tree.h"
+ 
+@@ -46,10 +47,14 @@
+ #define GUARD_SZ round_up(1ull << sizeof_field(struct bpf_insn, off) * 8, PAGE_SIZE << 1)
+ #define KERN_VM_SZ (SZ_4G + GUARD_SZ)
+ 
++static LIST_HEAD(arena_list);
++static DEFINE_SPINLOCK(arena_list_lock);
++
+ static void arena_free_pages(struct bpf_arena *arena, long uaddr, long page_cnt, bool sleepable);
+ 
+ struct bpf_arena {
+ 	struct bpf_map map;
++	struct list_head list;
+ 	u64 user_vm_start;
+ 	u64 user_vm_end;
+ 	struct vm_struct *kern_vm;
+@@ -332,6 +337,10 @@ static struct bpf_map *arena_map_alloc(union bpf_attr *attr)
+ 	if (err)
+ 		goto err_destroy_rt;
+ 
++	spin_lock(&arena_list_lock);
++	list_add_tail_rcu(&arena->list, &arena_list);
++	spin_unlock(&arena_list_lock);
++
+ 	return &arena->map;
+ 
+ err_destroy_rt:
+@@ -385,6 +394,12 @@ static void arena_map_free(struct bpf_map *map)
+ 	if (WARN_ON_ONCE(!list_empty(&arena->vma_list)))
+ 		return;
+ 
++	spin_lock(&arena_list_lock);
++	list_del_rcu(&arena->list);
++	spin_unlock(&arena_list_lock);
++
++	synchronize_rcu();
++
+ 	/* Ensure no pending deferred frees */
+ 	irq_work_sync(&arena->free_irq);
+ 	flush_work(&arena->free_work);
+@@ -1207,31 +1222,32 @@ bool bpf_arena_handle_page_fault(unsigned long addr, bool is_write, unsigned lon
+ 	struct bpf_prog *prog;
+ 	unsigned long kbase;
+ 	unsigned long page_addr = addr & PAGE_MASK;
+-
+-	prog = bpf_prog_find_from_stack();
+-	if (!prog)
+-		return false;
+-
+-	arena = prog->aux->arena;
+-	/* a prog not using arena may be on stack, so arena can be NULL */
+-	if (!arena)
+-		return false;
+-
+-	kbase = bpf_arena_get_kern_vm_start(arena);
++	bool handled = false;
+ 
+ 	/*
+ 	 * Recovery covers the 4 GiB mappable band plus the upper half-guard.
+ 	 * Lower guard is unreachable from kfuncs; an address there indicates
+ 	 * a different bug class - leave it to the regular kernel oops path.
+ 	 */
+-	if (page_addr < kbase || page_addr >= kbase + SZ_4G + GUARD_SZ / 2)
+-		return false;
+-
+-	apply_to_page_range(&init_mm, page_addr, PAGE_SIZE,
+-			    apply_range_set_scratch_cb, arena->scratch_page);
+-	flush_vmap_cache(page_addr, PAGE_SIZE);
+-	__bpf_prog_report_arena_violation(prog, is_write, page_addr - kbase, fault_ip);
+-	return true;
++	rcu_read_lock();
++	list_for_each_entry_rcu(arena, &arena_list, list) {
++		kbase = bpf_arena_get_kern_vm_start(arena);
++		if (page_addr < kbase || page_addr >= kbase + SZ_4G + GUARD_SZ / 2)
++			continue;
++
++		apply_to_page_range(&init_mm, page_addr, PAGE_SIZE,
++				    apply_range_set_scratch_cb, arena->scratch_page);
++		flush_vmap_cache(page_addr, PAGE_SIZE);
++
++		prog = bpf_prog_find_from_stack();
++		if (prog && prog->aux->arena == arena)
++			__bpf_prog_report_arena_violation(prog, is_write,
++							  page_addr - kbase, fault_ip);
++		handled = true;
++		break;
++	}
++	rcu_read_unlock();
++	return handled;
+ }
+ 
+ void bpf_prog_report_arena_violation(bool write, unsigned long addr, unsigned long fault_ip)
+-- 
+2.52.0
+
