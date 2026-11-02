@@ -137,6 +137,7 @@ TEST_KMOD_TARGETS = $(addprefix $(OUTPUT)/,$(TEST_KMODS))
 
 # Compile but not part of 'make run_tests'
 TEST_GEN_PROGS_EXTENDED = \
+	bpf_prog_free_stress \
 	bench \
 	flow_dissector_load \
 	test_cpp \

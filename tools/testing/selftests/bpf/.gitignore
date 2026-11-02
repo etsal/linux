@@ -2,6 +2,7 @@
 bpftool
 bpf-helpers*
 bpf-syscall*
+/bpf_prog_free_stress
 test_verifier
 test_maps
 test_lru_map
