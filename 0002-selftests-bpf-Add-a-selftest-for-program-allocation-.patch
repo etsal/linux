@@ -1,0 +1,234 @@
+From 39400c04a91df1b98ed2abe94c218703d021a62c Mon Sep 17 00:00:00 2001
+From: Emil Tsalapatis <emil@etsalapatis.com>
+Date: Sun, 1 Nov 2026 23:00:00 -0800
+Subject: [PATCH bpf 2/2] selftests/bpf: Add a selftest for program
+ allocation/freeing
+
+Add a selftest that stresses BPF program allocation/free
+paths.
+
+Signed-off-by: Emil Tsalapatis <emil@etsalapatis.com>
+---
+ tools/testing/selftests/bpf/.gitignore        |   1 +
+ tools/testing/selftests/bpf/Makefile          |   1 +
+ .../selftests/bpf/bpf_prog_free_stress.c      | 184 ++++++++++++++++++
+ 3 files changed, 186 insertions(+)
+ create mode 100644 tools/testing/selftests/bpf/bpf_prog_free_stress.c
+
+diff --git a/tools/testing/selftests/bpf/.gitignore b/tools/testing/selftests/bpf/.gitignore
+index 986a6389186b..ba72f8ac1f72 100644
+--- a/tools/testing/selftests/bpf/.gitignore
++++ b/tools/testing/selftests/bpf/.gitignore
+@@ -2,6 +2,7 @@
+ bpftool
+ bpf-helpers*
+ bpf-syscall*
++/bpf_prog_free_stress
+ test_verifier
+ test_maps
+ test_lru_map
+diff --git a/tools/testing/selftests/bpf/Makefile b/tools/testing/selftests/bpf/Makefile
+index 93c707116fad..e59e07c4bd12 100644
+--- a/tools/testing/selftests/bpf/Makefile
++++ b/tools/testing/selftests/bpf/Makefile
+@@ -137,6 +137,7 @@ TEST_KMOD_TARGETS = $(addprefix $(OUTPUT)/,$(TEST_KMODS))
+ 
+ # Compile but not part of 'make run_tests'
+ TEST_GEN_PROGS_EXTENDED = \
++	bpf_prog_free_stress \
+ 	bench \
+ 	flow_dissector_load \
+ 	test_cpp \
+diff --git a/tools/testing/selftests/bpf/bpf_prog_free_stress.c b/tools/testing/selftests/bpf/bpf_prog_free_stress.c
+new file mode 100644
+index 000000000000..8c761845c703
+--- /dev/null
++++ b/tools/testing/selftests/bpf/bpf_prog_free_stress.c
+@@ -0,0 +1,184 @@
++// SPDX-License-Identifier: GPL-2.0
++#define _GNU_SOURCE
++#include <errno.h>
++#include <err.h>
++#include <linux/bpf.h>
++#include <pthread.h>
++#include <sched.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/resource.h>
++#include <sys/syscall.h>
++#include <time.h>
++#include <unistd.h>
++
++#include "../../../include/linux/filter.h"
++
++/*
++ * Spread allocations over vmap nodes, then queue frees from CPU0, whose purge
++ * helper runs asynchronously. Tiny programs fill packs densely enough to build
++ * a backlog exceeding the system workqueue's active-work limit.
++ */
++#define LOAD_CPUS 64
++#define PROGRAMS 65536
++#define WAITERS 1024
++#define DEFAULT_DURATION_SEC 5
++
++static int fds[PROGRAMS];
++static const struct bpf_insn insns[] = {
++	BPF_MOV64_IMM(BPF_REG_0, 0),
++	BPF_EXIT_INSN(),
++};
++
++static void pin_cpu(int cpu)
++{
++	cpu_set_t mask;
++
++	CPU_ZERO(&mask);
++	CPU_SET(cpu, &mask);
++	if (sched_setaffinity(0, sizeof(mask), &mask))
++		err(EXIT_FAILURE, "sched_setaffinity CPU%d", cpu);
++}
++
++static int load_prog(void)
++{
++	union bpf_attr attr = {
++		.prog_type = BPF_PROG_TYPE_SOCKET_FILTER,
++		.insn_cnt = sizeof(insns) / sizeof(insns[0]),
++		.insns = (uintptr_t)insns,
++		.license = (uintptr_t)"GPL",
++	};
++	int fd;
++
++	fd = syscall(__NR_bpf, BPF_PROG_LOAD, &attr, sizeof(attr));
++	if (fd < 0)
++		err(EXIT_FAILURE, "BPF_PROG_LOAD");
++	return fd;
++}
++
++static void *load_worker(void *arg)
++{
++	int cpu = (uintptr_t)arg;
++	int first = cpu * (PROGRAMS / LOAD_CPUS);
++	int i;
++
++	pin_cpu(cpu);
++	for (i = first; i < first + PROGRAMS / LOAD_CPUS; i++)
++		fds[i] = load_prog();
++	return NULL;
++}
++
++static void *load_waiter(void *arg)
++{
++	(void)arg;
++
++	pin_cpu(0);
++	if (close(load_prog()))
++		err(EXIT_FAILURE, "close waiter program");
++	return NULL;
++}
++
++static void check_pthread(int error, const char *operation)
++{
++	if (error)
++		errx(EXIT_FAILURE, "%s: %s", operation, strerror(error));
++}
++
++static void run_threads(int count, void *(*worker)(void *))
++{
++	pthread_t threads[WAITERS];
++	pthread_attr_t attr;
++	int i;
++
++	check_pthread(pthread_attr_init(&attr), "pthread_attr_init");
++	check_pthread(pthread_attr_setstacksize(&attr, 64 * 1024),
++		      "pthread_attr_setstacksize");
++	for (i = 0; i < count; i++)
++		check_pthread(pthread_create(&threads[i], &attr, worker,
++					     (void *)(uintptr_t)i),
++			      "pthread_create");
++	for (i = 0; i < count; i++)
++		check_pthread(pthread_join(threads[i], NULL), "pthread_join");
++	check_pthread(pthread_attr_destroy(&attr), "pthread_attr_destroy");
++}
++
++static long monotonic_sec(void)
++{
++	struct timespec now;
++
++	if (clock_gettime(CLOCK_MONOTONIC, &now))
++		err(EXIT_FAILURE, "clock_gettime");
++	return now.tv_sec;
++}
++
++static long parse_duration(int argc, char **argv)
++{
++	char *end;
++	long duration;
++
++	if (argc == 1)
++		return DEFAULT_DURATION_SEC;
++	if (argc != 2)
++		errx(EXIT_FAILURE, "usage: %s [duration_sec]", argv[0]);
++
++	errno = 0;
++	duration = strtol(argv[1], &end, 10);
++	if (errno || *end || duration <= 0)
++		errx(EXIT_FAILURE, "usage: %s [duration_sec]", argv[0]);
++	return duration;
++}
++
++static void run_burst(int round)
++{
++	struct sched_param priority = { .sched_priority = 80 };
++	int i;
++
++	printf("Round %d: loading %d programs across %d CPUs\n", round,
++	       PROGRAMS, LOAD_CPUS);
++	run_threads(LOAD_CPUS, load_worker);
++	printf("Round %d: loaded %d programs; closing from CPU0\n", round,
++	       PROGRAMS);
++
++	if (sched_setscheduler(0, SCHED_FIFO, &priority))
++		err(EXIT_FAILURE, "sched_setscheduler SCHED_FIFO");
++	for (i = 0; i < PROGRAMS; i++)
++		if (close(fds[i]))
++			err(EXIT_FAILURE, "close program %d", i);
++	priority.sched_priority = 0;
++	if (sched_setscheduler(0, SCHED_OTHER, &priority))
++		err(EXIT_FAILURE, "sched_setscheduler SCHED_OTHER");
++
++	printf("Closed %d programs; starting %d allocation waiters\n",
++	       PROGRAMS, WAITERS);
++	run_threads(WAITERS, load_waiter);
++}
++
++int main(int argc, char **argv)
++{
++	struct rlimit limit = { PROGRAMS + 1024, PROGRAMS + 1024 };
++	long duration = parse_duration(argc, argv);
++	long start;
++	int round = 0;
++
++	setvbuf(stdout, NULL, _IOLBF, 0);
++	if (sysconf(_SC_NPROCESSORS_ONLN) < LOAD_CPUS)
++		errx(EXIT_FAILURE, "need at least %d online CPUs", LOAD_CPUS);
++
++	if (setrlimit(RLIMIT_NOFILE, &limit))
++		err(EXIT_FAILURE, "setrlimit RLIMIT_NOFILE");
++	limit.rlim_cur = limit.rlim_max = RLIM_INFINITY;
++	if (setrlimit(RLIMIT_MEMLOCK, &limit))
++		err(EXIT_FAILURE, "setrlimit RLIMIT_MEMLOCK");
++	pin_cpu(0);
++
++	printf("Running for %ld seconds\n", duration);
++	start = monotonic_sec();
++	do {
++		run_burst(++round);
++	} while (monotonic_sec() - start < duration);
++
++	printf("Completed %d rounds\n", round);
++	return EXIT_SUCCESS;
++}
+-- 
+2.52.0
+

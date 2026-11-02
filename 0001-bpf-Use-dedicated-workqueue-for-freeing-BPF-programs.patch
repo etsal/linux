@@ -1,0 +1,66 @@
+From 4d3de41d1a560316a215f3c0e796512690024721 Mon Sep 17 00:00:00 2001
+From: Emil Tsalapatis <emil@etsalapatis.com>
+Date: Sun, 1 Nov 2026 22:34:06 -0800
+Subject: [PATCH bpf 1/2] bpf: Use dedicated workqueue for freeing BPF programs
+
+Move deferred BPF program frees to a dedicated workqueue.
+
+BPF free workers can exhaust a CPU's system workqueue active slots while
+waiting for pack_mutex. The worker holding pack_mutex then waits for a
+vmalloc purge helper on that same queue, which cannot run until a slot
+is freed.
+
+Fixes: 6b88aaec81db ("x86/bpf: Enable EXECMEM_ROX_CACHE for BPF allocations")
+Reported-by: Andrii Nakryiko <andrii@kernel.org>
+Signed-off-by: Emil Tsalapatis <emil@etsalapatis.com>
+---
+ kernel/bpf/core.c | 19 ++++++++++++++++++-
+ 1 file changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/kernel/bpf/core.c b/kernel/bpf/core.c
+index 7f11555a5070..a4994438a8af 100644
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@ -23,6 +23,7 @@
+ #include <linux/skbuff.h>
+ #include <linux/static_call.h>
+ #include <linux/vmalloc.h>
++#include <linux/workqueue.h>
+ #include <linux/prandom.h>
+ #include <linux/bpf.h>
+ #include <linux/btf.h>
+@@ -3073,6 +3074,17 @@ static void bpf_free_used_btfs(struct bpf_prog_aux *aux)
+ 	kfree(aux->used_btfs);
+ }
+ 
++static struct workqueue_struct *bpf_prog_free_wq __ro_after_init;
++
++static int __init bpf_prog_free_wq_init(void)
++{
++	bpf_prog_free_wq = alloc_workqueue("bpf_prog_free", WQ_UNBOUND, 0);
++	if (!bpf_prog_free_wq)
++		panic("Failed to allocate BPF program free workqueue\n");
++	return 0;
++}
++early_initcall(bpf_prog_free_wq_init);
++
+ static void bpf_prog_free_deferred(struct work_struct *work)
+ {
+ 	struct bpf_prog_aux *aux;
+@@ -3122,7 +3134,12 @@ void bpf_prog_free(struct bpf_prog *fp)
+ 		bpf_prog_put(aux->dst_prog);
+ 	bpf_token_put(aux->token);
+ 	INIT_WORK(&aux->work, bpf_prog_free_deferred);
+-	schedule_work(&aux->work);
++	/*
++	 * A pack_mutex holder may wait for vmalloc work on system_percpu_wq.
++	 * Keep program frees off that queue so mutex waiters cannot exhaust
++	 * the active slots needed by the vmalloc work.
++	 */
++	queue_work(bpf_prog_free_wq, &aux->work);
+ }
+ EXPORT_SYMBOL_GPL(bpf_prog_free);
+ 
+-- 
+2.52.0
+

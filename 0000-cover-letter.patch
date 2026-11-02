@@ -1,0 +1,78 @@
+From 39400c04a91df1b98ed2abe94c218703d021a62c Mon Sep 17 00:00:00 2001
+From: Emil Tsalapatis <emil@etsalapatis.com>
+Date: Sun, 1 Nov 2026 23:28:14 -0800
+Subject: [PATCH bpf 0/2] bpf: Avoid workqueue deadlock when freeing programs
+
+BPF program freeing currently runs from the system workqueue. With BPF
+program pack allocations, freeing the last program in a pack can take
+pack_mutex and call into execmem/vmalloc code to change page permissions.
+That path may queue a vmalloc purge helper to the same CPU and wait for it
+to finish.
+
+If enough other BPF program free workers are already active on that CPU,
+they can all block on pack_mutex and consume the system workqueue active
+slots. The worker holding pack_mutex then waits for the vmalloc purge work,
+but that purge work cannot run because the queue is full of pack_mutex
+waiters:
+
+[   24.646667] INFO: task kworker/0:4:1291 blocked for more than 10 seconds.
+[   24.646669]       Not tainted 7.3.0-00001-gdeaa120a9b25-dirty #11
+[   24.646670] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+[   24.646671] task:kworker/0:4     state:D stack:0     pid:1291  tgid:1291  ppid:2      task_flags:0x4208060 flags:0x00080000
+[   24.646675] Workqueue: events bpf_prog_free_deferred
+[   24.646678] Call Trace:
+[   24.646680]  <TASK>
+[   24.646686]  __schedule+0x5bc/0x1430
+[   24.646702]  schedule+0x3f/0x100
+[   24.646706]  schedule_timeout+0x106/0x110
+[   24.646711]  ? srso_alias_return_thunk+0x5/0xfbef5
+[   24.646713]  ? mark_held_locks+0x49/0x80
+[   24.646720]  ? srso_alias_return_thunk+0x5/0xfbef5
+[   24.646723]  ? lockdep_hardirqs_on_prepare+0xdc/0x190
+[   24.646726]  ? srso_alias_return_thunk+0x5/0xfbef5
+[   24.646732]  __wait_for_common+0xc1/0x1d0
+[   24.646735]  ? __pfx_schedule_timeout+0x10/0x10
+[   24.646748]  ? __flush_work+0x1f8/0x550
+[   24.646751]  __flush_work+0x309/0x550
+[   24.646759]  ? __pfx_wq_barrier_func+0x10/0x10
+[   24.646783]  __purge_vmap_area_lazy+0x3e4/0x440
+[   24.646796]  _vm_unmap_aliases+0x2d5/0x330
+[   24.646810]  change_page_attr_set_clr+0xb9/0x580
+[   24.646817]  ? srso_alias_return_thunk+0x5/0xfbef5
+[   24.646833]  set_memory_nx+0x3b/0x50
+[   24.646838]  __execmem_cache_free+0x35/0xb0
+[   24.646848]  execmem_free+0x98/0x160
+[   24.646864]  bpf_prog_pack_free+0x152/0x190
+[   24.646871]  bpf_jit_binary_pack_free+0x17/0x90
+[   24.646876]  bpf_jit_free+0x5e/0x130
+[   24.646882]  process_one_work+0x289/0x790
+[   24.646886]  ? srso_alias_return_thunk+0x5/0xfbef5
+[   24.646888]  ? srso_alias_return_thunk+0x5/0xfbef5
+[   24.646902]  worker_thread+0x1b3/0x370
+[   24.646908]  ? __pfx_worker_thread+0x10/0x10
+[   24.646911]  kthread+0xf7/0x130
+[   24.646914]  ? __pfx_kthread+0x10/0x10
+[   24.646920]  ret_from_fork+0x293/0x300
+[   24.646923]  ? __pfx_kthread+0x10/0x10
+[   24.646927]  ret_from_fork_asm+0x1a/0x30
+[   24.646947]  </TASK>
+
+Move deferred BPF program freeing to a dedicated workqueue to avoid
+this.
+
+Signed-off-by: Emil Tsalapatis <emil@etsalapatis.com>
+
+Emil Tsalapatis (2):
+  bpf: Use dedicated workqueue for freeing BPF programs
+  selftests/bpf: Add a selftest for program allocation/freeing
+
+ kernel/bpf/core.c                             |  19 +-
+ tools/testing/selftests/bpf/.gitignore        |   1 +
+ tools/testing/selftests/bpf/Makefile          |   1 +
+ .../selftests/bpf/bpf_prog_free_stress.c      | 184 ++++++++++++++++++
+ 4 files changed, 204 insertions(+), 1 deletion(-)
+ create mode 100644 tools/testing/selftests/bpf/bpf_prog_free_stress.c
+
+-- 
+2.52.0
+
