@@ -1,0 +1,269 @@
+From 11220ef3a959d9e4f6f94f9d277a31b3935a990c Mon Sep 17 00:00:00 2001
+From: Emil Tsalapatis <emil@etsalapatis.com>
+Date: Fri, 23 Oct 2026 00:20:53 +0000
+Subject: [PATCH bpf-next v4 6/9] selftests/bpf: libarena: Handle NMI
+ reentrancy
+
+An NMI can interrupt the buddy allocator while it holds the buddy lock, so
+code running in NMI context must not wait for that lock.
+
+Use trylock for buddy operations in NMI context and normal locking in other
+contexts. If the buddy lock cannot be acquired, allocations return NULL
+and frees transfer ownership to an intrusive deferred-free list.
+
+Drain deferred frees on a later successful lock acquisition, including
+from NMI context.
+
+Signed-off-by: Emil Tsalapatis <emil@etsalapatis.com>
+---
+ .../bpf/libarena/include/libarena/buddy.h     |   3 +
+ .../bpf/libarena/selftests/test_buddy.bpf.c   |   2 +
+ .../selftests/bpf/libarena/src/buddy.bpf.c    | 128 ++++++++++++++++--
+ 3 files changed, 123 insertions(+), 10 deletions(-)
+
+diff --git a/tools/testing/selftests/bpf/libarena/include/libarena/buddy.h b/tools/testing/selftests/bpf/libarena/include/libarena/buddy.h
+index ec5e79a07540..7553ad5a879d 100644
+--- a/tools/testing/selftests/bpf/libarena/include/libarena/buddy.h
++++ b/tools/testing/selftests/bpf/libarena/include/libarena/buddy.h
+@@ -49,6 +49,8 @@ struct buddy_header {
+ 	u32 next_index; /* Same for the next allocation. */
+ };
+ 
++struct buddy_deferred_free;
++
+ /*
+  * We bring memory into the allocator 1 MiB at a time.
+  */
+@@ -103,6 +105,7 @@ struct buddy {
+ 	arena_spinlock_t lock;			/* Allocator lock */
+ 	u64 vaddr;				/* Allocation into reserved vaddr */
+ 	struct buddy_cache __arena *percpu[BUDDY_CACHE_MAX_CPUS];
++	struct buddy_deferred_free __arena *deferred_free;
+ };
+ 
+ #ifdef __BPF__
+diff --git a/tools/testing/selftests/bpf/libarena/selftests/test_buddy.bpf.c b/tools/testing/selftests/bpf/libarena/selftests/test_buddy.bpf.c
+index 85a7ea8b2e97..e7c6ac76433c 100644
+--- a/tools/testing/selftests/bpf/libarena/selftests/test_buddy.bpf.c
++++ b/tools/testing/selftests/bpf/libarena/selftests/test_buddy.bpf.c
+@@ -44,6 +44,8 @@ __weak int test_buddy_create(void)
+ 		ret = buddy_destroy(&buddy);
+ 		if (ret)
+ 			return ret;
++		if (buddy.deferred_free)
++			return -EINVAL;
+ 		if (buddy.percpu[0])
+ 			return -EINVAL;
+ 	}
+diff --git a/tools/testing/selftests/bpf/libarena/src/buddy.bpf.c b/tools/testing/selftests/bpf/libarena/src/buddy.bpf.c
+index 13c55cf53e52..4d4d21356935 100644
+--- a/tools/testing/selftests/bpf/libarena/src/buddy.bpf.c
++++ b/tools/testing/selftests/bpf/libarena/src/buddy.bpf.c
+@@ -6,6 +6,7 @@
+ #include <libarena/buddy.h>
+ 
+ #include <bpf_arena_spin_lock.h>
++#include <bpf_experimental.h>
+ 
+ _Static_assert(BUDDY_CACHE_MAX_CPUS == _Q_MAX_CPUS,
+ 	       "buddy caches must cover every CPU arena spinlocks support");
+@@ -46,10 +47,14 @@ static int idx_is_allocated(struct buddy_chunk __arena *chunk, u64 idx, bool *al
+ static u64 arena_next_pow2(__u64 n);
+ static u64 size_to_order(size_t size);
+ static void __arena *buddy_alloc_memory(struct buddy __arena *buddy, size_t size,
+-					int order, size_t norder);
++					int order, size_t norder, bool grow);
+ static int buddy_free_unlocked(struct buddy __arena *buddy, u64 addr);
++static bool buddy_deferred_free_pending(struct buddy __arena *buddy);
++static int buddy_deferred_free_complete(struct buddy __arena *buddy);
+ 
+-#define buddy_lock(buddy, flags) (arena_spin_lock_irqsave(&(buddy)->lock, (flags)))
++#define buddy_lock(buddy, flags)						\
++	(bpf_in_nmi() ? arena_spin_trylock_irqsave(&(buddy)->lock, (flags)) :	\
++			arena_spin_lock_irqsave(&(buddy)->lock, (flags)))
+ #define buddy_unlock(buddy, flags) (arena_spin_unlock_irqrestore(&(buddy)->lock, (flags)))
+ 
+ /*
+@@ -747,6 +752,7 @@ __weak int buddy_init(struct buddy __arena *buddy)
+ 
+ 	if (!asan_ready())
+ 		return -EINVAL;
++	buddy->deferred_free = NULL;
+ 
+ 	/* Reserve enough address space to ensure allocations are aligned. */
+ 	ret = buddy_reserve_arena_vaddr(buddy);
+@@ -817,6 +823,7 @@ __weak int buddy_destroy(struct buddy __arena *buddy)
+ 
+ 	/* Clear all fields. */
+ 	buddy->first_chunk = NULL;
++	buddy->deferred_free = NULL;
+ 
+ 	return 0;
+ }
+@@ -970,6 +977,13 @@ static void __arena *buddy_alloc_memory(struct buddy __arena *buddy, size_t size
+ 	if (buddy_lock(buddy, flags))
+ 		return NULL;
+ 
++	if (unlikely(buddy_deferred_free_pending(buddy))) {
++		if (buddy_deferred_free_complete(buddy)) {
++			buddy_unlock(buddy, flags);
++			return NULL;
++		}
++	}
++
+ 	address = (u8 __arena *)buddy_alloc_from_existing_chunks(buddy, order, norder);
+ 	buddy_unlock(buddy, flags);
+ 	if (address)
+@@ -1176,10 +1190,90 @@ static __always_inline int buddy_free_unlocked(struct buddy __arena *buddy, u64
+ 	return 0;
+ }
+ 
++static bool buddy_deferred_free_pending(struct buddy __arena *buddy)
++{
++	return buddy->deferred_free != NULL;
++}
++
++static __always_inline void buddy_deferred_free_push(struct buddy __arena *buddy,
++						   void __arena *first, void __arena *last)
++{
++	void __arena *head;
++
++	do {
++		head = READ_ONCE(buddy->deferred_free);
++		*(void __arena * __arena *)last = head;
++	} while (cmpxchg((void __arena * __arena *)&buddy->deferred_free,
++			 head, first) != head && can_loop);
++}
++
++static void buddy_deferred_free_start(struct buddy __arena *buddy, void __arena *addr)
++{
++	/*
++	 * Make a linked list by chaining the allocations into a linked list.
++	 * Possible because allocations are 16 bytes minimum and so fit a pointer.
++	 */
++	asan_unpoison(addr, sizeof(void *));
++	buddy_deferred_free_push(buddy, addr, addr);
++}
++
++static void buddy_deferred_free_start_bulk(struct buddy __arena *buddy,
++		 void __arena * __arena *addrs, size_t naddrs)
++{
++	void __arena *first, *last, *addr;
++	unsigned int i;
++
++	/*
++	 * Chain the allocations into a local linked list. Possible because
++	 * allocations are 16 bytes minimum and so fit a pointer.
++	 */
++	first = NULL;
++	last = NULL;
++	for (i = zero; i < naddrs && can_loop; i++) {
++		addr = addrs[i];
++		if (!addr)
++			continue;
++
++		asan_unpoison(addr, sizeof(void *));
++
++		if (!first)
++			first = addr;
++		else
++			*(void __arena * __arena *)last = addr;
++
++		last = addr;
++	}
++
++	if (!first)
++		return;
++
++	/* Splice the local list onto the deferred-free list. */
++	buddy_deferred_free_push(buddy, first, last);
++}
++
++static int buddy_deferred_free_complete(struct buddy __arena *buddy)
++{
++	void __arena *head, *old;
++	int ret = 0, err;
++
++	head = __sync_lock_test_and_set((void __arena * __arena *)&buddy->deferred_free,
++					NULL);
++
++	while (head && can_loop) {
++		old = head;
++		head = *(void __arena * __arena *)head;
++
++		err = buddy_free_unlocked(buddy, (u64)old);
++		ret = ret ?: err;
++	}
++
++	return ret;
++}
++
+ __weak int buddy_free(struct buddy __arena *buddy, void __arena *addr)
+ {
+ 	unsigned long flags;
+-	int ret;
++	int ret, err;
+ 
+ 	if (!buddy)
+ 		return -EINVAL;
+@@ -1193,20 +1287,28 @@ __weak int buddy_free(struct buddy __arena *buddy, void __arena *addr)
+ 		return 0;
+ 
+ 	ret = buddy_lock(buddy, flags);
+-	if (ret)
+-		return ret;
++	if (ret) {
++		buddy_deferred_free_start(buddy, addr);
++		return 0;
++	}
+ 
+ 	ret = buddy_free_unlocked(buddy, (u64)addr);
+ 
++	/* Drain any frees stranded during NMI/lock failure. */
++	if (unlikely(buddy_deferred_free_pending(buddy))) {
++		err = buddy_deferred_free_complete(buddy);
++		ret = ret ?: err;
++	}
++
+ 	buddy_unlock(buddy, flags);
+ 
+ 	return ret;
+ }
+ 
+ /*
+- * Fails only when the arguments are invalid or the buddy lock cannot be taken.
+- * Nothing is freed in either case. Objects that buddy_free_unlocked() rejects
+- * are reported there.
++ * Reject a NULL buddy or a NULL address array for a nonempty batch with -EINVAL.
++ * Valid objects are freed under the buddy lock or deferred on lock failure.
++ * Objects that buddy_free_unlocked() rejects are reported there.
+  */
+ __weak int buddy_free_bulk(struct buddy __arena *buddy, void __arena * __arena *addrs, size_t naddrs)
+ {
+@@ -1224,8 +1326,10 @@ __weak int buddy_free_bulk(struct buddy __arena *buddy, void __arena * __arena *
+ 		return -EINVAL;
+ 
+ 	ret = buddy_lock(buddy, flags);
+-	if (ret)
+-		return ret;
++	if (ret) {
++		buddy_deferred_free_start_bulk(buddy, addrs, naddrs);
++		return 0;
++	}
+ 
+ 	for (i = zero; i < naddrs && can_loop; i++) {
+ 		/* NULL pointers are ignored. */
+@@ -1235,6 +1339,10 @@ __weak int buddy_free_bulk(struct buddy __arena *buddy, void __arena * __arena *
+ 		buddy_free_unlocked(buddy, (u64)addrs[i]);
+ 	}
+ 
++	/* Drain any frees stranded during an NMI/lock failure. */
++	if (unlikely(buddy_deferred_free_pending(buddy)))
++		buddy_deferred_free_complete(buddy);
++
+ 	buddy_unlock(buddy, flags);
+ 
+ 	return 0;
+-- 
+2.52.0
+

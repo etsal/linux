@@ -1,0 +1,81 @@
+From a9ea4819d79d89cf907d93ab885762f852a746ab Mon Sep 17 00:00:00 2001
+From: Emil Tsalapatis <emil@etsalapatis.com>
+Date: Thu, 5 Nov 2026 14:10:52 -0800
+Subject: [PATCH bpf-next v4 3/9] selftests/bpf: libarena: Make spinlock
+ trylock match arena_spin_unlock
+
+The arena_spin_trylock() macro is currently only used within the
+lock slowpath, and so does not disable preemption. However, this
+means it does not properly pair with arena_spin_unlock() that does.
+Rename the existing function to arena_spin_trylock_raw() to denote
+it just handles the test-and-test-and-set, and make a version of
+the function that handles preemption. Also add an _irqsave() variant.
+
+Fixes: 88d706ba7cc5 ("selftests/bpf: Introduce arena spin lock")
+Signed-off-by: Emil Tsalapatis <emil@etsalapatis.com>
+---
+ .../libarena/include/bpf_arena_spin_lock.h    | 34 +++++++++++++++++--
+ 1 file changed, 32 insertions(+), 2 deletions(-)
+
+diff --git a/tools/testing/selftests/bpf/libarena/include/bpf_arena_spin_lock.h b/tools/testing/selftests/bpf/libarena/include/bpf_arena_spin_lock.h
+index 055b5892cb63..560ee18fd287 100644
+--- a/tools/testing/selftests/bpf/libarena/include/bpf_arena_spin_lock.h
++++ b/tools/testing/selftests/bpf/libarena/include/bpf_arena_spin_lock.h
+@@ -233,7 +233,26 @@ static __always_inline int arena_spin_trylock(arena_spinlock_t __arena *lock)
+ 	if (unlikely(val))
+ 		return 0;
+ 
+-	return likely(atomic_try_cmpxchg_acquire(&lock->val, &val, _Q_LOCKED_VAL));
++	bpf_preempt_disable();
++	val = atomic_try_cmpxchg_acquire(&lock->val, &val, _Q_LOCKED_VAL);
++	if (unlikely(!val))
++		bpf_preempt_enable();
++
++	return val;
++}
++
++/*
++ * Trylock variant without preemption disable/reenable.
++ * Used within the lock slowpath.
++ */
++static __always_inline int arena_spin_trylock_raw(arena_spinlock_t __arena *lock)
++{
++	int val = atomic_read(&lock->val);
++
++	if (unlikely(val))
++		return 0;
++
++	return atomic_try_cmpxchg_acquire(&lock->val, &val, _Q_LOCKED_VAL);
+ }
+ 
+ __noinline __weak
+@@ -346,7 +365,7 @@ int arena_spin_lock_slowpath(arena_spinlock_t __arena *lock, u32 val)
+ 	 * attempt the trylock once more in the hope someone let go while we
+ 	 * weren't watching.
+ 	 */
+-	if (arena_spin_trylock(lock))
++	if (arena_spin_trylock_raw(lock))
+ 		goto release;
+ 
+ 	/*
+@@ -527,6 +546,17 @@ static __always_inline void arena_spin_unlock(arena_spinlock_t __arena *lock)
+ 		(__ret);                                 \
+ 	})
+ 
++#define arena_spin_trylock_irqsave(lock, flags)			\
++	({							\
++		int __ret;					\
++		bpf_local_irq_save(&(flags));			\
++		__ret = arena_spin_trylock((lock)) ? 0 : -EBUSY;\
++		if (__ret)					\
++			bpf_local_irq_restore(&(flags)); 	\
++		(__ret);                                 	\
++	})
++
++
+ #define arena_spin_unlock_irqrestore(lock, flags) \
+ 	({                                        \
+ 		arena_spin_unlock((lock));        \
+-- 
+2.52.0
+
