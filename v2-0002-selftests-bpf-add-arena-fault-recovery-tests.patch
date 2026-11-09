@@ -1,0 +1,281 @@
+From 9014bcb9e9c1fc650b731a42a023e2b02c836ac9 Mon Sep 17 00:00:00 2001
+From: Emil Tsalapatis <emil@etsalapatis.com>
+Date: Tue, 27 Oct 2026 17:12:15 -0700
+Subject: [PATCH bpf-next v2 2/2] selftests/bpf: add arena fault recovery tests
+
+Test the arena fault handling code with two new selftests.
+The first one confirms that a program without an arena (and
+by extension a code path that doesn't involve BPF at all)
+properly recovers after accessing an unbacked arena page.
+The second test deploys the same configuration for a program
+that has its own arena map.
+
+Signed-off-by: Emil Tsalapatis <emil@etsalapatis.com>
+---
+ .../selftests/bpf/prog_tests/arena_fault.c    | 100 ++++++++++++++++++
+ .../testing/selftests/bpf/progs/arena_fault.c |  65 ++++++++++++
+ .../selftests/bpf/progs/arena_fault_noarena.c |  17 +++
+ .../selftests/bpf/test_kmods/bpf_testmod.c    |  22 ++++
+ .../bpf/test_kmods/bpf_testmod_kfunc.h        |   3 +
+ 5 files changed, 207 insertions(+)
+ create mode 100644 tools/testing/selftests/bpf/prog_tests/arena_fault.c
+ create mode 100644 tools/testing/selftests/bpf/progs/arena_fault.c
+ create mode 100644 tools/testing/selftests/bpf/progs/arena_fault_noarena.c
+
+diff --git a/tools/testing/selftests/bpf/prog_tests/arena_fault.c b/tools/testing/selftests/bpf/prog_tests/arena_fault.c
+new file mode 100644
+index 000000000000..8bde1f67e4b4
+--- /dev/null
++++ b/tools/testing/selftests/bpf/prog_tests/arena_fault.c
+@@ -0,0 +1,100 @@
++// SPDX-License-Identifier: GPL-2.0
++
++#include <test_progs.h>
++#include "arena_fault.skel.h"
++#include "arena_fault_noarena.skel.h"
++
++static int run_syscall_prog(struct bpf_program *prog, const char *name)
++{
++	LIBBPF_OPTS(bpf_test_run_opts, opts);
++	int err;
++
++	err = bpf_prog_test_run_opts(bpf_program__fd(prog), &opts);
++	if (!ASSERT_OK(err, name))
++		return -1;
++	if (!ASSERT_OK(opts.retval, name))
++		return -1;
++	return 0;
++}
++
++static void test_wrong_arena(void)
++{
++	struct arena_fault *fault_skel = NULL;
++	struct arena_fault *stash_skel = NULL;
++
++	stash_skel = arena_fault__open();
++	if (!ASSERT_OK_PTR(stash_skel, "open_stash"))
++		return;
++
++	if (stash_skel->data->skip) {
++		test__skip();
++		goto out;
++	}
++	if (!ASSERT_OK(arena_fault__load(stash_skel), "load_stash"))
++		goto out;
++
++	fault_skel = arena_fault__open_and_load();
++	if (!ASSERT_OK_PTR(fault_skel, "open_load_fault"))
++		goto out;
++
++	if (run_syscall_prog(stash_skel->progs.stash_and_free, "stash_and_free"))
++		goto out;
++	run_syscall_prog(fault_skel->progs.fault_stashed_wrong_arena,
++			 "fault_stashed_wrong_arena");
++
++out:
++	if (stash_skel && bpf_program__fd(stash_skel->progs.clear_stashed) >= 0)
++		run_syscall_prog(stash_skel->progs.clear_stashed, "clear_stashed");
++	arena_fault__destroy(fault_skel);
++	arena_fault__destroy(stash_skel);
++}
++
++static void test_no_arena(void)
++{
++	struct arena_fault_noarena *fault_skel = NULL;
++	struct arena_fault *stash_skel = NULL;
++
++	stash_skel = arena_fault__open();
++	if (!ASSERT_OK_PTR(stash_skel, "open_stash"))
++		return;
++
++	if (stash_skel->data->skip) {
++		test__skip();
++		goto out;
++	}
++	if (!ASSERT_OK(arena_fault__load(stash_skel), "load_stash"))
++		goto out;
++
++	fault_skel = arena_fault_noarena__open_and_load();
++	if (!ASSERT_OK_PTR(fault_skel, "open_load_noarena"))
++		goto out;
++
++	if (run_syscall_prog(stash_skel->progs.stash_and_free, "stash_and_free"))
++		goto out;
++	run_syscall_prog(fault_skel->progs.fault_stashed_noarena,
++			 "fault_stashed_noarena");
++
++out:
++	if (stash_skel && bpf_program__fd(stash_skel->progs.clear_stashed) >= 0)
++		run_syscall_prog(stash_skel->progs.clear_stashed, "clear_stashed");
++	arena_fault_noarena__destroy(fault_skel);
++	arena_fault__destroy(stash_skel);
++}
++
++void serial_test_arena_fault(void)
++{
++#if !defined(__x86_64__) && !defined(__aarch64__)
++	test__skip();
++	return;
++#endif
++
++	if (!env.has_testmod) {
++		test__skip();
++		return;
++	}
++
++	if (test__start_subtest("wrong_arena"))
++		test_wrong_arena();
++	if (test__start_subtest("no_arena"))
++		test_no_arena();
++}
+diff --git a/tools/testing/selftests/bpf/progs/arena_fault.c b/tools/testing/selftests/bpf/progs/arena_fault.c
+new file mode 100644
+index 000000000000..89fde45217dc
+--- /dev/null
++++ b/tools/testing/selftests/bpf/progs/arena_fault.c
+@@ -0,0 +1,65 @@
++// SPDX-License-Identifier: GPL-2.0
++
++#define BPF_NO_KFUNC_PROTOTYPES
++#include <vmlinux.h>
++#include <bpf/bpf_helpers.h>
++#include "bpf_arena_common.h"
++#include "../test_kmods/bpf_testmod_kfunc.h"
++
++struct {
++	__uint(type, BPF_MAP_TYPE_ARENA);
++	__uint(map_flags, BPF_F_MMAPABLE);
++	__uint(max_entries, 2);
++} arena SEC(".maps");
++
++u64 __arena arena_pad;
++volatile u64 observed;
++
++#ifdef __BPF_FEATURE_ADDR_SPACE_CAST
++bool skip SEC(".data") = false;
++#else
++bool skip = true;
++#endif
++
++SEC("syscall")
++int stash_and_free(void *ctx)
++{
++#ifdef __BPF_FEATURE_ADDR_SPACE_CAST
++	u64 __arena *val;
++
++	val = bpf_arena_alloc_pages(&arena, NULL, 1, NUMA_NO_NODE, 0);
++	if (!val)
++		return 1;
++
++	*val = 42;
++	bpf_test_arena_fault_stash((u64 *)val);
++	bpf_arena_free_pages(&arena, val, 1);
++#endif
++	return 0;
++}
++
++SEC("syscall")
++int fault_stashed_wrong_arena(void *ctx)
++{
++#ifdef __BPF_FEATURE_ADDR_SPACE_CAST
++	u64 __arena *val;
++
++	val = bpf_arena_alloc_pages(&arena, NULL, 1, NUMA_NO_NODE, 0);
++	if (!val)
++		return 1;
++
++	*val = 1;
++	observed = bpf_test_arena_fault_load_stashed();
++	bpf_arena_free_pages(&arena, val, 1);
++#endif
++	return observed != 0;
++}
++
++SEC("syscall")
++int clear_stashed(void *ctx)
++{
++	bpf_test_arena_fault_clear_stashed();
++	return 0;
++}
++
++char _license[] SEC("license") = "GPL";
+diff --git a/tools/testing/selftests/bpf/progs/arena_fault_noarena.c b/tools/testing/selftests/bpf/progs/arena_fault_noarena.c
+new file mode 100644
+index 000000000000..7bb0e6dbd260
+--- /dev/null
++++ b/tools/testing/selftests/bpf/progs/arena_fault_noarena.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: GPL-2.0
++
++#define BPF_NO_KFUNC_PROTOTYPES
++#include <vmlinux.h>
++#include <bpf/bpf_helpers.h>
++#include "../test_kmods/bpf_testmod_kfunc.h"
++
++volatile u64 observed;
++
++SEC("syscall")
++int fault_stashed_noarena(void *ctx)
++{
++	observed = bpf_test_arena_fault_load_stashed();
++	return observed != 0;
++}
++
++char _license[] SEC("license") = "GPL";
+diff --git a/tools/testing/selftests/bpf/test_kmods/bpf_testmod.c b/tools/testing/selftests/bpf/test_kmods/bpf_testmod.c
+index 76fbe64755ef..f33a7345f9ce 100644
+--- a/tools/testing/selftests/bpf/test_kmods/bpf_testmod.c
++++ b/tools/testing/selftests/bpf/test_kmods/bpf_testmod.c
+@@ -344,6 +344,25 @@ __bpf_kfunc u64 bpf_kfunc_arena_mixed_test(u64 *a__arena, u64 *b__arena__nullabl
+ 	return *a__arena + (b__arena__nullable ? *b__arena__nullable : 0);
+ }
+ 
++static u64 *arena_fault_stashed_ptr;
++
++__bpf_kfunc void bpf_test_arena_fault_stash(u64 *ptr__arena)
++{
++	WRITE_ONCE(arena_fault_stashed_ptr, ptr__arena);
++}
++
++__bpf_kfunc u64 bpf_test_arena_fault_load_stashed(void)
++{
++	u64 *ptr = READ_ONCE(arena_fault_stashed_ptr);
++
++	return ptr ? READ_ONCE(*ptr) : U64_MAX;
++}
++
++__bpf_kfunc void bpf_test_arena_fault_clear_stashed(void)
++{
++	WRITE_ONCE(arena_fault_stashed_ptr, NULL);
++}
++
+ __bpf_kfunc void bpf_kfunc_dynptr_test(struct bpf_dynptr *ptr,
+ 				       struct bpf_dynptr *ptr__nullable)
+ {
+@@ -1048,6 +1067,9 @@ BTF_ID_FLAGS(func, bpf_kfunc_arena_cap_nullable_test)
+ BTF_ID_FLAGS(func, bpf_kfunc_arena_args5_test)
+ BTF_ID_FLAGS(func, bpf_kfunc_arena_stack_arg_test)
+ BTF_ID_FLAGS(func, bpf_kfunc_arena_mixed_test)
++BTF_ID_FLAGS(func, bpf_test_arena_fault_stash)
++BTF_ID_FLAGS(func, bpf_test_arena_fault_load_stashed)
++BTF_ID_FLAGS(func, bpf_test_arena_fault_clear_stashed)
+ BTF_ID_FLAGS(func, bpf_kfunc_call_test_mem_len_pass1)
+ BTF_ID_FLAGS(func, bpf_kfunc_dynptr_test)
+ BTF_ID_FLAGS(func, bpf_kfunc_nested_acquire_nonzero_offset_test, KF_ACQUIRE)
+diff --git a/tools/testing/selftests/bpf/test_kmods/bpf_testmod_kfunc.h b/tools/testing/selftests/bpf/test_kmods/bpf_testmod_kfunc.h
+index e9902e651d72..9ec69fd57d98 100644
+--- a/tools/testing/selftests/bpf/test_kmods/bpf_testmod_kfunc.h
++++ b/tools/testing/selftests/bpf/test_kmods/bpf_testmod_kfunc.h
+@@ -212,6 +212,9 @@ __u64 bpf_kfunc_arena_args5_test(__u64 *a__arena, __u64 *b__arena,
+ __u64 bpf_kfunc_arena_stack_arg_test(__u64 a, __u64 b, __u64 c, __u64 d, __u64 e,
+ 				     __u64 *f__arena) __ksym;
+ __u64 bpf_kfunc_arena_mixed_test(__u64 *a__arena, __u64 *b__arena__nullable) __ksym;
++void bpf_test_arena_fault_stash(__u64 *ptr__arena) __ksym;
++__u64 bpf_test_arena_fault_load_stashed(void) __ksym;
++void bpf_test_arena_fault_clear_stashed(void) __ksym;
+ int *bpf_kfunc_call_test_get_rdwr_mem(struct prog_test_ref_kfunc *p, const int rdwr_buf_size) __ksym;
+ int *bpf_kfunc_call_test_get_rdonly_mem(struct prog_test_ref_kfunc *p, const int rdonly_buf_size) __ksym;
+ int *bpf_kfunc_call_test_acq_rdonly_mem(struct prog_test_ref_kfunc *p, const int rdonly_buf_size) __ksym;
+-- 
+2.52.0
+

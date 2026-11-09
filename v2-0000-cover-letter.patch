@@ -1,0 +1,51 @@
+From 9014bcb9e9c1fc650b731a42a023e2b02c836ac9 Mon Sep 17 00:00:00 2001
+From: Emil Tsalapatis <emil@etsalapatis.com>
+Date: Mon, 9 Nov 2026 09:50:46 -0800
+Subject: [PATCH bpf-next v2 0/2] bpf: expand BPF arena kernel fault handling
+
+Currently, the BPF arena fault handler protects against
+a misbehaving BPF program passing an arena pointer to a
+kfunc then unmapping the backing pages, causing a kernel
+fault. However, it does not handle errors where the now
+unmapped arena address is instead accessed by a non-BPF
+path, or by a BPF program that has a different arena.
+The former case is already possible in sched-ext if a
+BPF program removes from the arena pages allocated
+from the genpool allocator.
+
+Keep a list of all arenas in the system and attempt to match
+the kernel fault to all of them. If the fault does fall in
+an arena, handle it with the already established scratch
+page technique and retry the access.
+
+Cc: Tejun Heo <tj@kernel.org>
+Signed-off-by: Emil Tsalapatis <emil@etsalapatis.com>
+
+Changes from v1 to v2:
+- Replace the global arena list with a latch rbtree.
+- Restore the stack lookup fast path, checking the fault address before
+  falling back to the tree lookup.
+- Defer arena teardown with RCU work instead of synchronize_rcu().
+- Add rate-limited deferred logging for faults outside the owning BPF program.
+- Reuse bpf_testmod for the selftests instead of adding a module.
+- Skip the selftests when the compiler lacks arena address-space casts.
+- Correct the Fixes tag to reference the introduction of kernel arena accesses.
+
+Emil Tsalapatis (2):
+  bpf: recover page faults across all arenas
+  selftests/bpf: add arena fault recovery tests
+
+ kernel/bpf/arena.c                            | 119 +++++++++++++-----
+ .../selftests/bpf/prog_tests/arena_fault.c    | 100 +++++++++++++++
+ .../testing/selftests/bpf/progs/arena_fault.c |  65 ++++++++++
+ .../selftests/bpf/progs/arena_fault_noarena.c |  17 +++
+ .../selftests/bpf/test_kmods/bpf_testmod.c    |  22 ++++
+ .../bpf/test_kmods/bpf_testmod_kfunc.h        |   3 +
+ 6 files changed, 298 insertions(+), 28 deletions(-)
+ create mode 100644 tools/testing/selftests/bpf/prog_tests/arena_fault.c
+ create mode 100644 tools/testing/selftests/bpf/progs/arena_fault.c
+ create mode 100644 tools/testing/selftests/bpf/progs/arena_fault_noarena.c
+
+-- 
+2.52.0
+
