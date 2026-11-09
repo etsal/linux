@@ -369,9 +369,9 @@ err:
 DEFINE_PARALLEL_SPMC_TEST(singleval, TEST_SPMC_SINGLEVAL_ITERS)
 
 /*
- * The resize test. Force a resize from the owner even while the stealers
- * are trying to consume. Then make sure the queue is still consistent
- * after the resize.
+ * The resize test. Force a resize before releasing the stealers, then race
+ * additional pushes and steals against the resized array. Make sure the
+ * queue is still consistent after the resize.
  *
  * The owner _doesn't_ consume from the queue. The test makes sure that
  * switching the array from underneath the stealers works.
@@ -416,17 +416,21 @@ void spmc_waste_time(void)
 
 static int spmc_resize_owner(void)
 {
-	bool resized = false;
 	u64 i;
 	int ret;
 
-	/* Get a head start vs the consumers. */
-	for (i = zero; i < TEST_SPMC_RESIZE_PREFILL && can_loop; i++) {
+	/* Force the next resize before consumers can make room in the array. */
+	for (i = zero; i <= TEST_SPMC_RESIZE_PREFILL && can_loop; i++) {
 		ret = spmc_owned_add(spmc, i);
 		if (ret) {
 			test_abort = true;
 			return ret;
 		}
+	}
+
+	if (spmc->cur->order <= TEST_SPMC_RESIZE_ORDER) {
+		test_abort = true;
+		return -EINVAL;
 	}
 
 	__sync_fetch_and_add(&owner_epoch, 1);
@@ -436,21 +440,12 @@ static int spmc_resize_owner(void)
 	if (ret)
 		return ret;
 
-	for (i = TEST_SPMC_RESIZE_PREFILL; i < TEST_SPMC_RESIZE_TOTAL && can_loop; i++) {
+	for (i = TEST_SPMC_RESIZE_PREFILL + 1; i < TEST_SPMC_RESIZE_TOTAL && can_loop; i++) {
 		ret = spmc_owned_add(spmc, i);
 		if (ret) {
 			test_abort = true;
 			return ret;
 		}
-
-		if (spmc->cur->order > TEST_SPMC_RESIZE_ORDER)
-			resized = true;
-	}
-
-	/* Did we get to resize while racing? */
-	if (!resized) {
-		test_abort = true;
-		return -EINVAL;
 	}
 
 	/* 
