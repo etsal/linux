@@ -1,0 +1,62 @@
+From 62558ff22d0f7d8ae9f81ab31bbb696733077677 Mon Sep 17 00:00:00 2001
+From: Emil Tsalapatis <emil@etsalapatis.com>
+Date: Mon, 9 Nov 2026 18:20:49 +0000
+Subject: [PATCH bpf-next v5 4/9] selftests/bpf: libarena: Raise arena spinlock
+ CPU limits
+
+Bump the maximum number of CPUs supported by the arena spinlocks
+to 8K, up from 1K.
+
+Signed-off-by: Emil Tsalapatis <emil@etsalapatis.com>
+---
+ .../selftests/bpf/libarena/include/bpf_arena_spin_lock.h    | 6 +++---
+ tools/testing/selftests/bpf/progs/arena_spin_lock.c         | 2 +-
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/tools/testing/selftests/bpf/libarena/include/bpf_arena_spin_lock.h b/tools/testing/selftests/bpf/libarena/include/bpf_arena_spin_lock.h
+index c0eedb59986d..8422c0939c83 100644
+--- a/tools/testing/selftests/bpf/libarena/include/bpf_arena_spin_lock.h
++++ b/tools/testing/selftests/bpf/libarena/include/bpf_arena_spin_lock.h
+@@ -77,7 +77,7 @@ struct arena_qnode {
+  * 16-17: tail index
+  * 18-31: tail cpu (+1)
+  */
+-#define _Q_MAX_CPUS		1024
++#define _Q_MAX_CPUS		8192
+ 
+ #define	_Q_SET_MASK(type)	(((1U << _Q_ ## type ## _BITS) - 1)\
+ 				      << _Q_ ## type ## _OFFSET)
+@@ -109,7 +109,7 @@ static inline u32 encode_tail(int cpu, int idx)
+ {
+ 	u32 tail;
+ 
+-	tail  = (cpu + 1) << _Q_TAIL_CPU_OFFSET;
++	tail  = (u32)(cpu + 1) << _Q_TAIL_CPU_OFFSET;
+ 	tail |= idx << _Q_TAIL_IDX_OFFSET; /* assume < 4 */
+ 
+ 	return tail;
+@@ -509,7 +509,7 @@ static __always_inline int arena_spin_lock(arena_spinlock_t __arena *lock)
+ {
+ 	int val = 0;
+ 
+-	if (CONFIG_NR_CPUS > 1024)
++	if (CONFIG_NR_CPUS > _Q_MAX_CPUS)
+ 		return -EOPNOTSUPP;
+ 
+ 	bpf_preempt_disable();
+diff --git a/tools/testing/selftests/bpf/progs/arena_spin_lock.c b/tools/testing/selftests/bpf/progs/arena_spin_lock.c
+index 92e75ec3844c..9e91e562a4ea 100644
+--- a/tools/testing/selftests/bpf/progs/arena_spin_lock.c
++++ b/tools/testing/selftests/bpf/progs/arena_spin_lock.c
+@@ -10,7 +10,7 @@
+ struct {
+ 	__uint(type, BPF_MAP_TYPE_ARENA);
+ 	__uint(map_flags, BPF_F_MMAPABLE);
+-	__uint(max_entries, 100); /* number of pages */
++	__uint(max_entries, 256); /* number of pages, including qnodes */
+ #ifdef __TARGET_ARCH_arm64
+ 	__ulong(map_extra, 0x1ull << 32); /* start of mmap() region */
+ #else
+-- 
+2.52.0
+
