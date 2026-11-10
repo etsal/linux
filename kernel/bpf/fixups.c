@@ -3392,6 +3392,16 @@ patch_map_ops_generic:
 			goto next_insn;
 		}
 
+		/* The same call can be reached from both sleepable and
+		 * non-sleepable contexts. Only use GFP_KERNEL if all paths
+		 * reaching this task storage helper can sleep.
+		 */
+		if (insn->imm == BPF_FUNC_task_storage_get &&
+		    !env->insn_aux_data[i].non_sleepable) {
+			insn->imm = BPF_CALL_IMM(bpf_task_storage_get_sleepable);
+			goto next_insn;
+		}
+
 		/* Implement bpf_kptr_xchg inline */
 		if (prog->jit_requested && BITS_PER_LONG == 64 &&
 		    insn->imm == BPF_FUNC_kptr_xchg &&

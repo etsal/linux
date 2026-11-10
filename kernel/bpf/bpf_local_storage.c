@@ -69,6 +69,9 @@ static bool selem_linked_to_map(const struct bpf_local_storage_elem *selem)
 static void *bpf_local_storage_alloc_mem(struct bpf_local_storage_map *smap,
 					size_t size, bool sleepable)
 {
+	if (sleepable)
+		return bpf_map_kzalloc(&smap->map, size, GFP_KERNEL);
+
 	return bpf_map_kmalloc_nolock(&smap->map, size, __GFP_ZERO, NUMA_NO_NODE);
 }
 
@@ -723,6 +726,14 @@ bpf_local_storage_update(void *owner, struct bpf_local_storage_map *smap,
 {
 	return __bpf_local_storage_update(owner, smap, value, map_flags,
 					  swap_uptrs, false);
+}
+
+struct bpf_local_storage_data *
+bpf_local_storage_sleepable(void *owner, struct bpf_local_storage_map *smap,
+			    void *value, u64 map_flags, bool swap_uptrs)
+{
+	return __bpf_local_storage_update(owner, smap, value, map_flags,
+					  swap_uptrs, true);
 }
 
 static u16 bpf_local_storage_cache_idx_get(struct bpf_local_storage_cache *cache)

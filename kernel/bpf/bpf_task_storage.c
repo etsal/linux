@@ -165,8 +165,9 @@ out:
 	return err;
 }
 
-BPF_CALL_4(bpf_task_storage_get, struct bpf_map *, map, struct task_struct *,
-	   task, void *, value, u64, flags)
+static unsigned long __bpf_task_storage_get(struct bpf_map *map,
+					  struct task_struct *task, void *value,
+					  u64 flags, bool sleepable)
 {
 	struct bpf_local_storage_data *sdata;
 
@@ -181,13 +182,30 @@ BPF_CALL_4(bpf_task_storage_get, struct bpf_map *, map, struct task_struct *,
 	/* only allocate new storage, when the task is refcounted */
 	if (refcount_read(&task->usage) &&
 	    (flags & BPF_LOCAL_STORAGE_GET_F_CREATE)) {
-		sdata = bpf_local_storage_update(
-			task, (struct bpf_local_storage_map *)map, value,
-			BPF_NOEXIST, false);
+		if (sleepable)
+			sdata = bpf_local_storage_sleepable(
+				task, (struct bpf_local_storage_map *)map, value,
+				BPF_NOEXIST, false);
+		else
+			sdata = bpf_local_storage_update(
+				task, (struct bpf_local_storage_map *)map, value,
+				BPF_NOEXIST, false);
 		return IS_ERR(sdata) ? (unsigned long)NULL : (unsigned long)sdata->data;
 	}
 
 	return (unsigned long)NULL;
+}
+
+BPF_CALL_4(bpf_task_storage_get, struct bpf_map *, map, struct task_struct *,
+	   task, void *, value, u64, flags)
+{
+	return __bpf_task_storage_get(map, task, value, flags, false);
+}
+
+BPF_CALL_4(bpf_task_storage_get_sleepable, struct bpf_map *, map,
+	   struct task_struct *, task, void *, value, u64, flags)
+{
+	return __bpf_task_storage_get(map, task, value, flags, true);
 }
 
 BPF_CALL_2(bpf_task_storage_delete, struct bpf_map *, map, struct task_struct *,
