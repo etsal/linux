@@ -66,17 +66,22 @@ static bool selem_linked_to_map(const struct bpf_local_storage_elem *selem)
 	return !hlist_unhashed(&selem->map_node);
 }
 
-struct bpf_local_storage_elem *
-bpf_selem_alloc(struct bpf_local_storage_map *smap, void *owner,
-		void *value, bool swap_uptrs)
+static void *bpf_local_storage_alloc_mem(struct bpf_local_storage_map *smap,
+					size_t size, bool sleepable)
+{
+	return bpf_map_kmalloc_nolock(&smap->map, size, __GFP_ZERO, NUMA_NO_NODE);
+}
+
+static struct bpf_local_storage_elem *
+__bpf_selem_alloc(struct bpf_local_storage_map *smap, void *owner,
+		  void *value, bool swap_uptrs, bool sleepable)
 {
 	struct bpf_local_storage_elem *selem;
 
 	if (mem_charge(smap, owner, smap->elem_size))
 		return NULL;
 
-	selem = bpf_map_kmalloc_nolock(&smap->map, smap->elem_size,
-				       __GFP_ZERO, NUMA_NO_NODE);
+	selem = bpf_local_storage_alloc_mem(smap, smap->elem_size, sleepable);
 
 	if (selem) {
 		RCU_INIT_POINTER(SDATA(selem)->smap, smap);
@@ -94,6 +99,13 @@ bpf_selem_alloc(struct bpf_local_storage_map *smap, void *owner,
 	mem_uncharge(smap, owner, smap->elem_size);
 
 	return NULL;
+}
+
+struct bpf_local_storage_elem *
+bpf_selem_alloc(struct bpf_local_storage_map *smap, void *owner,
+		void *value, bool swap_uptrs)
+{
+	return __bpf_selem_alloc(smap, owner, value, swap_uptrs, false);
 }
 
 static void bpf_local_storage_free_trace_rcu(struct rcu_head *rcu)
@@ -498,9 +510,10 @@ static int check_flags(const struct bpf_local_storage_data *old_sdata,
 	return 0;
 }
 
-int bpf_local_storage_alloc(void *owner,
-			    struct bpf_local_storage_map *smap,
-			    struct bpf_local_storage_elem *first_selem)
+static int __bpf_local_storage_alloc(void *owner,
+				     struct bpf_local_storage_map *smap,
+				     struct bpf_local_storage_elem *first_selem,
+				     bool sleepable)
 {
 	struct bpf_local_storage *prev_storage, *storage;
 	struct bpf_local_storage **owner_storage_ptr;
@@ -512,8 +525,7 @@ int bpf_local_storage_alloc(void *owner,
 	if (err)
 		return err;
 
-	storage = bpf_map_kmalloc_nolock(&smap->map, sizeof(*storage),
-					 __GFP_ZERO, NUMA_NO_NODE);
+	storage = bpf_local_storage_alloc_mem(smap, sizeof(*storage), sleepable);
 	if (!storage) {
 		err = -ENOMEM;
 		goto uncharge;
@@ -567,14 +579,22 @@ uncharge:
 	return err;
 }
 
+int bpf_local_storage_alloc(void *owner,
+			    struct bpf_local_storage_map *smap,
+			    struct bpf_local_storage_elem *first_selem)
+{
+	return __bpf_local_storage_alloc(owner, smap, first_selem, false);
+}
+
 /* sk cannot be going away because it is linking new elem
  * to sk->sk_bpf_storage. (i.e. sk->sk_refcnt cannot be 0).
  * Otherwise, it will become a leak (and other memory issues
  * during map destruction).
  */
-struct bpf_local_storage_data *
-bpf_local_storage_update(void *owner, struct bpf_local_storage_map *smap,
-			 void *value, u64 map_flags, bool swap_uptrs)
+static struct bpf_local_storage_data *
+__bpf_local_storage_update(void *owner, struct bpf_local_storage_map *smap,
+			   void *value, u64 map_flags, bool swap_uptrs,
+			   bool sleepable)
 {
 	struct bpf_local_storage_data *old_sdata = NULL;
 	struct bpf_local_storage_elem *alloc_selem, *selem = NULL;
@@ -599,11 +619,11 @@ bpf_local_storage_update(void *owner, struct bpf_local_storage_map *smap,
 		if (err)
 			return ERR_PTR(err);
 
-		selem = bpf_selem_alloc(smap, owner, value, swap_uptrs);
+		selem = __bpf_selem_alloc(smap, owner, value, swap_uptrs, sleepable);
 		if (!selem)
 			return ERR_PTR(-ENOMEM);
 
-		err = bpf_local_storage_alloc(owner, smap, selem);
+		err = __bpf_local_storage_alloc(owner, smap, selem, sleepable);
 		if (err) {
 			bpf_selem_free(selem, true);
 			mem_uncharge(smap, owner, smap->elem_size);
@@ -633,7 +653,7 @@ bpf_local_storage_update(void *owner, struct bpf_local_storage_map *smap,
 	/* A lookup has just been done before and concluded a new selem is
 	 * needed. The chance of an unnecessary alloc is unlikely.
 	 */
-	alloc_selem = selem = bpf_selem_alloc(smap, owner, value, swap_uptrs);
+	alloc_selem = selem = __bpf_selem_alloc(smap, owner, value, swap_uptrs, sleepable);
 	if (!alloc_selem)
 		return ERR_PTR(-ENOMEM);
 
@@ -695,6 +715,14 @@ free_selem:
 		bpf_selem_free(alloc_selem, true);
 	}
 	return err ? ERR_PTR(err) : SDATA(selem);
+}
+
+struct bpf_local_storage_data *
+bpf_local_storage_update(void *owner, struct bpf_local_storage_map *smap,
+			 void *value, u64 map_flags, bool swap_uptrs)
+{
+	return __bpf_local_storage_update(owner, smap, value, map_flags,
+					  swap_uptrs, false);
 }
 
 static u16 bpf_local_storage_cache_idx_get(struct bpf_local_storage_cache *cache)
