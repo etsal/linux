@@ -549,6 +549,21 @@ void *bpf_map_kmalloc_nolock(const struct bpf_map *map, size_t size, gfp_t flags
 	return ptr;
 }
 
+void *bpf_map_kmalloc_maylock(const struct bpf_map *map, size_t size, gfp_t flags,
+			      int node)
+{
+	struct mem_cgroup *memcg, *old_memcg;
+	void *ptr;
+
+	bpf_map_memcg_enter(map, &old_memcg, &memcg);
+	/* Accounted allocations do not use the kmalloc token. */
+	ptr = alloc_hooks(bpf_kmalloc_maylock_noprof(size, flags | __GFP_ACCOUNT,
+						     node, (kmalloc_token_t){}));
+	bpf_map_memcg_exit(old_memcg, memcg);
+
+	return ptr;
+}
+
 void *bpf_map_kzalloc(const struct bpf_map *map, size_t size, gfp_t flags)
 {
 	struct mem_cgroup *memcg, *old_memcg;

@@ -3037,6 +3037,32 @@ struct page *bpf_alloc_page(int nid, bool sleepable);
 int bpf_alloc_pages(int nid, unsigned long nr_pages,
 		    struct llist_head *pages, bool sleepable);
 void bpf_free_pages(struct llist_head *pages);
+
+/*
+ * Try kmalloc_nolock() first to keep its larger-cache retry. The spinning
+ * fallback keeps the same size and GFP limits but uses the normal slab
+ * hooks, so free with kfree() or kfree_rcu().
+ */
+static __always_inline void *
+bpf_kmalloc_maylock_noprof(size_t size, gfp_t flags, int node,
+			   kmalloc_token_t token)
+{
+	const gfp_t nolock_flags = __GFP_ACCOUNT | __GFP_ZERO |
+				   __GFP_NOWARN | __GFP_NOMEMALLOC;
+	void *ptr;
+
+	ptr = _kmalloc_nolock_noprof(PASS_TOKEN_PARAMS(size, token), flags, node);
+	if (ptr)
+		return ptr;
+
+	if (IS_ENABLED(CONFIG_PREEMPT_RT) || !preemptible() ||
+	    size > KMALLOC_MAX_CACHE_SIZE || (flags & ~nolock_flags))
+		return NULL;
+
+	flags |= __GFP_NOWARN | __GFP_NOMEMALLOC;
+	return _kmalloc_node_noprof(size, flags, node, token);
+}
+
 #ifdef CONFIG_MEMCG
 void bpf_map_memcg_enter(const struct bpf_map *map, struct mem_cgroup **old_memcg,
 			 struct mem_cgroup **new_memcg);
@@ -3046,6 +3072,8 @@ void *bpf_map_kmalloc_node(const struct bpf_map *map, size_t size, gfp_t flags,
 			   int node);
 void *bpf_map_kmalloc_nolock(const struct bpf_map *map, size_t size, gfp_t flags,
 			     int node);
+void *bpf_map_kmalloc_maylock(const struct bpf_map *map, size_t size, gfp_t flags,
+			      int node);
 void *bpf_map_kzalloc(const struct bpf_map *map, size_t size, gfp_t flags);
 void *bpf_map_kvcalloc(struct bpf_map *map, size_t n, size_t size,
 		       gfp_t flags);
@@ -3060,6 +3088,9 @@ void __percpu *bpf_map_alloc_percpu(const struct bpf_map *map, size_t size,
 		kmalloc_node(_size, _flags, _node)
 #define bpf_map_kmalloc_nolock(_map, _size, _flags, _node)	\
 		kmalloc_nolock(_size, _flags, _node)
+#define bpf_map_kmalloc_maylock(_map, _size, _flags, _node)		\
+		alloc_hooks(bpf_kmalloc_maylock_noprof(_size, _flags, _node,	\
+						       __kmalloc_token(_size)))
 #define bpf_map_kzalloc(_map, _size, _flags)			\
 		kzalloc(_size, _flags)
 #define bpf_map_kvcalloc(_map, _n, _size, _flags)		\
