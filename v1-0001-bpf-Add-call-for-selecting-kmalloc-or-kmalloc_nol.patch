@@ -1,0 +1,120 @@
+From b18d0febd2b753ff6d25b79826542a92a863c566 Mon Sep 17 00:00:00 2001
+From: Emil Tsalapatis <emil@etsalapatis.com>
+Date: Thu, 19 Nov 2026 11:01:33 -0800
+Subject: [PATCH bpf-next v1 1/4] bpf: Add call for selecting kmalloc or
+ kmalloc_nolock at call time
+
+Certain parts of the BPF runtime like task-locl storage call
+kmalloc_nolock by default, even when the context within which
+they are called could use regular (nonsleepable) kmalloc. Add
+a helper for determining whether we can try to satisfy the
+allocation with a regular kmalloc, and make a call to kmalloc
+with GFP_NOWAIT when possible before resorting to kmalloc_nolock.
+
+Spinning on the lock instead of only doing kmalloc_nolock avoids
+unnecessary allocation failures. Using trylock instead of committing
+to spinning during allocation risks failures under contention in the
+critical path. Normally, kmalloc_nolock falls back to ZONE_DMA32 that
+is in practice never contended, but the zone may be below the low
+watermark and fail to allocate. This is the case, e.g., in systems with
+a large amount of hugepages in use (hugepages also allocate form
+ZONE_DMA32 when necessary, lowering it to below the watermark).
+
+Make both calls in succession to maximize the possibility of success.
+kmalloc_nolock() tries buckets larger than the requested size's
+when necesary, which kmalloc() does not. The two calls are therefore
+complementary, and we cannot call just kmalloc() when it is available.
+
+Signed-off-by: Emil Tsalapatis <emil@etsalapatis.com>
+---
+ include/linux/bpf.h            |  3 +++
+ kernel/bpf/bpf_local_storage.c |  6 ++----
+ kernel/bpf/syscall.c           | 27 +++++++++++++++++++++++++--
+ 3 files changed, 30 insertions(+), 6 deletions(-)
+
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index a5ad08b7937c7..5565a735ae7ce 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -3037,6 +3037,9 @@ struct page *bpf_alloc_page(int nid, bool sleepable);
+ int bpf_alloc_pages(int nid, unsigned long nr_pages,
+ 		    struct llist_head *pages, bool sleepable);
+ void bpf_free_pages(struct llist_head *pages);
++
++void *bpf_map_kmalloc_maylock(const struct bpf_map *map, size_t size, gfp_t flags);
++
+ #ifdef CONFIG_MEMCG
+ void bpf_map_memcg_enter(const struct bpf_map *map, struct mem_cgroup **old_memcg,
+ 			 struct mem_cgroup **new_memcg);
+diff --git a/kernel/bpf/bpf_local_storage.c b/kernel/bpf/bpf_local_storage.c
+index b12fcec47ffa0..bd79754a1e2fd 100644
+--- a/kernel/bpf/bpf_local_storage.c
++++ b/kernel/bpf/bpf_local_storage.c
+@@ -75,8 +75,7 @@ bpf_selem_alloc(struct bpf_local_storage_map *smap, void *owner,
+ 	if (mem_charge(smap, owner, smap->elem_size))
+ 		return NULL;
+ 
+-	selem = bpf_map_kmalloc_nolock(&smap->map, smap->elem_size,
+-				       __GFP_ZERO, NUMA_NO_NODE);
++	selem = bpf_map_kmalloc_maylock(&smap->map, smap->elem_size, __GFP_ZERO);
+ 
+ 	if (selem) {
+ 		RCU_INIT_POINTER(SDATA(selem)->smap, smap);
+@@ -512,8 +511,7 @@ int bpf_local_storage_alloc(void *owner,
+ 	if (err)
+ 		return err;
+ 
+-	storage = bpf_map_kmalloc_nolock(&smap->map, sizeof(*storage),
+-					 __GFP_ZERO, NUMA_NO_NODE);
++	storage = bpf_map_kmalloc_maylock(&smap->map, sizeof(*storage), __GFP_ZERO);
+ 	if (!storage) {
+ 		err = -ENOMEM;
+ 		goto uncharge;
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index ec8e787929112..4c72b05e11eb0 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -597,15 +597,38 @@ static void bpf_map_release_memcg(struct bpf_map *map)
+ }
+ #endif
+ 
+-static bool can_alloc_pages(void)
++static bool can_spin_in_alloc(void)
+ {
+ 	return preempt_count() == 0 && !irqs_disabled() &&
+ 		!IS_ENABLED(CONFIG_PREEMPT_RT);
+ }
+ 
++void *bpf_map_kmalloc_maylock(const struct bpf_map *map, size_t size, gfp_t flags)
++{
++	const gfp_t nolock_flags = __GFP_ACCOUNT | __GFP_ZERO |
++				   __GFP_NOWARN | __GFP_NOMEMALLOC;
++	struct mem_cgroup *memcg, *old_memcg;
++	void *ptr = NULL;
++
++	bpf_map_memcg_enter(map, &old_memcg, &memcg);
++	if (IS_ENABLED(CONFIG_MEMCG))
++		flags |= __GFP_ACCOUNT;
++
++	/* Only try the spinning allocation when preemption disables are tracked. */
++	if (IS_ENABLED(CONFIG_PREEMPT_COUNT) && can_spin_in_alloc() &&
++	    size <= KMALLOC_MAX_CACHE_SIZE && !(flags & ~nolock_flags))
++		ptr = kmalloc(size, flags | GFP_NOWAIT | __GFP_NOMEMALLOC);
++	/* Allocation failed or kmalloc_nolock()-only context. */
++	if (!ptr)
++		ptr = kmalloc_nolock(size, flags, NUMA_NO_NODE);
++
++	bpf_map_memcg_exit(old_memcg, memcg);
++	return ptr;
++}
++
+ struct page *bpf_alloc_page(int nid, bool sleepable)
+ {
+-	if (!sleepable || !can_alloc_pages())
++	if (!sleepable || !can_spin_in_alloc())
+ 		return alloc_pages_nolock(__GFP_ACCOUNT, nid, 0);
+ 
+ 	return alloc_pages_node(nid,
+-- 
+2.52.1
+
